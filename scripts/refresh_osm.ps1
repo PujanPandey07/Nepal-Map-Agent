@@ -16,6 +16,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+if (-not $SkipDownload -and -not ($DownloadUrl -match "^https?://")) {
+    throw "Security validation failed: Download URL must start with http:// or https://"
+}
+
 # Paths
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDir

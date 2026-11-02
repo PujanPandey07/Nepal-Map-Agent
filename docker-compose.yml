@@ -10,9 +10,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     ports:
-      # left side = your laptop, right side = inside the container.
-      # Your other Postgres owns 5432, so we use 5433 outside.
-      - "5433:5432"
+      # Bind strictly to localhost so database is not exposed to local network
+      - "127.0.0.1:5433:5432"
     volumes:
       # Named volume so the imported data survives container removal.
       # Postgres 18+ images use /var/lib/postgresql (older ones used
@@ -26,7 +25,8 @@ services:
       dockerfile: Dockerfile
     container_name: nepal-geo-data
     ports:
-      - "8001:8001"
+      # Bind strictly to localhost
+      - "127.0.0.1:8001:8001"
     environment:
       DB_HOST: nepal-postgis
       DB_PORT: 5432

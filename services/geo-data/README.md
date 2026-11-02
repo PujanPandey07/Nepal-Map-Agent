@@ -55,7 +55,7 @@ Import into PostGIS using the `iboates/osm2pgsql` container:
 docker run --rm `
     --network nepal-map-agent_default `
     -v "${PWD}\data:/data" `
-    -e PGPASSWORD=1717-pujan `
+    -e PGPASSWORD=$POSTGRES_PASSWORD `
     iboates/osm2pgsql `
     -c -s -l -k `
     -H nepal-postgis -P 5432 -U map-osm -d nepal_osm `

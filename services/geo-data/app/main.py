@@ -1,14 +1,16 @@
 # services/geo-data/app/main.py
 import asyncio
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from tlf_geo_profiler import profile_dict
 
 from app import config
-from app.db_client import DBError, fetch_amenities
+from app.db_client import DBError, close_pool, fetch_amenities, init_pool
 from app.models import AmenitiesResponse, HealthResponse, ProfileResponse, ResolveResponse
 from app.resolve_client import ResolveError, parse_candidates, pick_best, resolve_place, resolve_query
 
@@ -40,10 +42,25 @@ CATEGORY_ORDER = [
 async def lifespan(app: FastAPI):
     # Warm-up: make the package load its boundary data now, not on the first request
     await asyncio.to_thread(profile_dict, 27.7040, 85.3070)
+    try:
+        await init_pool()
+    except Exception as e:
+        logger.warning("Database pool could not be initialized at startup: %s", e)
     yield
+    await close_pool()
 
 
 app = FastAPI(title="geo-data service", lifespan=lifespan)
+
+# Restrict CORS to configured origins (default localhost dev ports)
+_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:8000,http://127.0.0.1:3000,http://127.0.0.1:8000").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in _origins if o.strip()],
+    allow_credentials=True,
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 
 
 # ── testable helper (makes mocking profile_dict easy in tests) ───────────────
@@ -75,7 +92,8 @@ async def get_resolve(
     try:
         return await resolve_query(q)
     except ResolveError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        logger.error("Resolve error: %s", e)
+        raise HTTPException(status_code=502, detail="Geocoding service unavailable")
 
 
 @app.get("/profile", response_model=ProfileResponse)
@@ -143,7 +161,8 @@ async def get_amenities(
     try:
         amenities = await fetch_amenities(lat, lon, radius_m)
     except DBError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        logger.error("Database error in /amenities: %s", e)
+        raise HTTPException(status_code=502, detail="Spatial database query failed")
 
     # Group into ordered categories
     categories: dict[str, list] = {cat: [] for cat in CATEGORY_ORDER}

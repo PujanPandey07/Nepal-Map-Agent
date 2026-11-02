@@ -22,6 +22,7 @@ from typing import Any
 import psycopg
 from psycopg.types import TypeInfo
 from psycopg.types.hstore import register_hstore
+from psycopg_pool import AsyncConnectionPool
 
 from app import config
 from app.amenity_utils import classify_element, deduplicate, to_amenity_dict
@@ -190,6 +191,50 @@ def _row_to_element(row: dict[str, Any], element_type: str) -> dict:
     }
 
 
+# ── connection pool ──────────────────────────────────────────────────────────
+
+_pool: AsyncConnectionPool | None = None
+
+
+async def _configure_connection(conn: psycopg.AsyncConnection) -> None:
+    """Configures each connection upon creation: sets dict_row and registers hstore."""
+    conn.row_factory = psycopg.rows.dict_row
+    hstore_info = await TypeInfo.fetch(conn, "hstore")
+    if hstore_info:
+        register_hstore(hstore_info, conn)
+
+
+async def init_pool() -> AsyncConnectionPool:
+    """Initialize and open the database connection pool."""
+    global _pool
+    if _pool is None:
+        _pool = AsyncConnectionPool(
+            conninfo=config.DB_DSN,
+            min_size=1,
+            max_size=10,
+            open=False,
+            configure=_configure_connection,
+        )
+        await _pool.open()
+    return _pool
+
+
+async def close_pool() -> None:
+    """Close the database connection pool."""
+    global _pool
+    if _pool is not None:
+        await _pool.close()
+        _pool = None
+
+
+async def get_pool() -> AsyncConnectionPool:
+    """Get active connection pool, initializing lazily if not already open."""
+    global _pool
+    if _pool is None:
+        return await init_pool()
+    return _pool
+
+
 # ── main public function ──────────────────────────────────────────────────────
 
 async def fetch_amenities(lat: float, lon: float, radius_m: int) -> list[dict]:
@@ -200,14 +245,8 @@ async def fetch_amenities(lat: float, lon: float, radius_m: int) -> list[dict]:
     Raises DBError if the database query fails.
     """
     try:
-        async with await psycopg.AsyncConnection.connect(
-            config.DB_DSN,
-            row_factory=psycopg.rows.dict_row,
-        ) as conn:
-            hstore_info = await TypeInfo.fetch(conn, "hstore")
-            if hstore_info:
-                register_hstore(hstore_info, conn)
-
+        pool = await get_pool()
+        async with pool.connection() as conn:
             # Points
             async with conn.cursor() as cur:
                 await cur.execute(_POINTS_SQL, (lon, lat, radius_m))
@@ -221,7 +260,7 @@ async def fetch_amenities(lat: float, lon: float, radius_m: int) -> list[dict]:
                 )
                 poly_rows = await cur.fetchall()
 
-    except psycopg.Error as exc:
+    except (psycopg.Error, Exception) as exc:
         logger.error("Database error: %s", exc)
         raise DBError(f"PostGIS query failed: {exc}") from exc
 
