@@ -1,13 +1,21 @@
 # services/geo-data/app/main.py
 import asyncio
 import logging
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
 from tlf_geo_profiler import profile_dict
 
-from app.osm_client import OverpassError, fetch_amenities
+from app import config
+from app.db_client import DBError, fetch_amenities
+from app.models import AmenitiesResponse, HealthResponse, ProfileResponse, ResolveResponse
 from app.resolve_client import ResolveError, parse_candidates, pick_best, resolve_place, resolve_query
+
+# psycopg (async) requires SelectorEventLoop on Windows; uvicorn defaults to
+# ProactorEventLoop which is incompatible.  Switch early before the loop starts.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 logger = logging.getLogger("geo-data")
 
@@ -47,12 +55,12 @@ async def _call_profile_dict(lat: float, lon: float) -> dict:
 
 # ── endpoints ─────────────────────────────────────────────────────────────────
 
-@app.get("/health")
+@app.get("/health", response_model=HealthResponse)
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "data_as_of": config.DATA_AS_OF}
 
 
-@app.get("/resolve")
+@app.get("/resolve", response_model=ResolveResponse)
 async def get_resolve(
     q: str = Query(..., min_length=1, description="Nepal place name to look up"),
 ):
@@ -70,7 +78,7 @@ async def get_resolve(
         raise HTTPException(status_code=502, detail=str(e))
 
 
-@app.get("/profile")
+@app.get("/profile", response_model=ProfileResponse)
 async def get_profile(
     lat: float = Query(..., ge=-90, le=90, description="Latitude"),
     lon: float = Query(..., ge=-180, le=180, description="Longitude"),
@@ -108,7 +116,7 @@ async def get_profile(
     }
 
 
-@app.get("/amenities")
+@app.get("/amenities", response_model=AmenitiesResponse)
 async def get_amenities(
     lat: float = Query(..., ge=-90, le=90),
     lon: float = Query(..., ge=-180, le=180),
@@ -134,7 +142,7 @@ async def get_amenities(
     """
     try:
         amenities = await fetch_amenities(lat, lon, radius_m)
-    except OverpassError as e:
+    except DBError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
     # Group into ordered categories
@@ -148,7 +156,8 @@ async def get_amenities(
     totals = {cat: len(items) for cat, items in categories.items()}
 
     return {
-        "source": "overpass",
+        "source": "postgis",
+        "data_as_of": config.DATA_AS_OF,
         "radius_m": radius_m,
         "data_warning": DATA_WARNING,
         "categories": categories,

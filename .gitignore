@@ -1,2 +1,7 @@
 .env
+*.env
 data/*.osm.pbf
+__pycache__/
+*.pyc
+.pytest_cache/
+mapenv/

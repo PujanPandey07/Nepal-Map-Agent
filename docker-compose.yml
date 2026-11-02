@@ -20,5 +20,23 @@ services:
       - osm_pgdata:/var/lib/postgresql
     restart: unless-stopped
 
+  geo-data:
+    build:
+      context: ./services/geo-data
+      dockerfile: Dockerfile
+    container_name: nepal-geo-data
+    ports:
+      - "8001:8001"
+    environment:
+      DB_HOST: nepal-postgis
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB:-nepal_osm}
+      DB_USER: ${POSTGRES_USER:-map-osm}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DATA_AS_OF: ${DATA_AS_OF:-2026-10-29}
+    depends_on:
+      - postgis
+    restart: unless-stopped
+
 volumes:
   osm_pgdata:

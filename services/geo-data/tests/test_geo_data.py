@@ -396,7 +396,9 @@ class TestHealthEndpoint:
     async def test_returns_ok(self, client):
         resp = await client.get("/health")
         assert resp.status_code == 200
-        assert resp.json() == {"status": "ok"}
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert "data_as_of" in data  # date of the imported OSM data
 
 
 class TestProfileEndpoint:
@@ -448,7 +450,7 @@ class TestAmenitiesEndpoint:
                 "/amenities?lat=27.7040&lon=85.3070&radius_m=5000")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["source"] == "overpass"
+        assert data["source"] == "postgis"
         assert data["radius_m"] == 5000
         assert "data_warning" in data
         assert data["totals"]["health"] == 1
@@ -464,10 +466,10 @@ class TestAmenitiesEndpoint:
                     "infrastructure", "food_and_water", "government", "other"]:
             assert cat in data["categories"], f"Missing category: {cat}"
 
-    async def test_overpass_failure_returns_502(self, client):
-        from app.osm_client import OverpassError
+    async def test_db_failure_returns_502(self, client):
+        from app.db_client import DBError
         with patch("app.main.fetch_amenities",
-                   new=AsyncMock(side_effect=OverpassError("all servers down"))):
+                   new=AsyncMock(side_effect=DBError("connection refused"))):
             resp = await client.get("/amenities?lat=27.7040&lon=85.3070")
         assert resp.status_code == 502
 
@@ -588,3 +590,148 @@ class TestResolveEndpoint:
             assert result["address"]["name_ne"] is None
             assert result["address"]["type"] is None
             assert result["address"]["city"] == "TestPlace"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# db_client unit tests (mock the psycopg connection)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestDbClientRowConversion:
+    """Unit-test _row_to_element without touching the database."""
+
+    def test_point_row_maps_to_node(self):
+        from app.db_client import _row_to_element
+        row = {
+            "osm_id": 12345,
+            "lat": 27.70,
+            "lon": 85.31,
+            "amenity": "hospital",
+            "aeroway": None,
+            "office": None,
+            "shop": None,
+            "name": "City Hospital",
+            "healthcare": None,
+            "emergency": None,
+            "extra_tags": {},
+        }
+        el = _row_to_element(row, "node")
+        assert el["type"] == "node"
+        assert el["id"] == 12345
+        assert el["lat"] == 27.70
+        assert el["lon"] == 85.31
+        assert el["tags"]["amenity"] == "hospital"
+        assert el["tags"]["name"] == "City Hospital"
+
+    def test_polygon_row_maps_to_way(self):
+        from app.db_client import _row_to_element
+        row = {
+            "osm_id": 99,
+            "lat": 27.5,
+            "lon": 83.9,
+            "amenity": "school",
+            "aeroway": None,
+            "office": None,
+            "shop": None,
+            "name": None,
+            "healthcare": None,
+            "emergency": None,
+            "extra_tags": {"capacity": "500"},
+        }
+        el = _row_to_element(row, "way")
+        assert el["type"] == "way"
+        assert el["tags"]["amenity"] == "school"
+        assert el["tags"]["capacity"] == "500"
+        # way element must have a center so extract_coords finds it
+        assert el["center"]["lat"] == 27.5
+        assert el["center"]["lon"] == 83.9
+
+    def test_healthcare_from_hstore_tag(self):
+        from app.db_client import _row_to_element
+        row = {
+            "osm_id": 1,
+            "lat": 27.7, "lon": 85.3,
+            "amenity": None, "aeroway": None, "office": None, "shop": None,
+            "name": "Health Post",
+            "healthcare": "health_post",
+            "emergency": None,
+            "extra_tags": {},
+        }
+        el = _row_to_element(row, "node")
+        assert el["tags"]["healthcare"] == "health_post"
+        # classify_element should map this to health category
+        from app.amenity_utils import classify_element
+        assert classify_element(el["tags"]) == "health"
+
+    def test_row_to_element_feeds_deduplicate(self):
+        """Two rows with the same name close together should dedup to one."""
+        from app.db_client import _row_to_element
+        from app.amenity_utils import deduplicate
+        base = {
+            "amenity": "school", "aeroway": None, "office": None, "shop": None,
+            "healthcare": None, "emergency": None, "extra_tags": {},
+        }
+        row_a = {**base, "osm_id": 1, "lat": 27.7000, "lon": 85.3000, "name": "Test School"}
+        row_b = {**base, "osm_id": 2, "lat": 27.7001, "lon": 85.3001, "name": "Test School"}
+        elements = [_row_to_element(row_a, "node"), _row_to_element(row_b, "way")]
+        deduped = deduplicate(elements)
+        assert len(deduped) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Integration test — real PostGIS database (skipped when DB is not reachable)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import os as _os
+
+
+def _db_available() -> bool:
+    """Return True if the PostGIS container is reachable."""
+    import socket
+    host = _os.getenv("DB_HOST", "localhost")
+    port = int(_os.getenv("DB_PORT", "5433"))
+    try:
+        with socket.create_connection((host, port), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+_DB_SKIP = pytest.mark.skipif(
+    not _db_available(),
+    reason="PostGIS not reachable (set DB_HOST/DB_PORT or start the container)",
+)
+
+
+class TestDbClientIntegration:
+    """Integration tests against the real local PostGIS database."""
+
+    @_DB_SKIP
+    async def test_chhatradev_returns_amenities(self):
+        """
+        Chhatradev Rural Municipality (Arghakhanchi) at 10 km radius.
+        Expect at least some evacuation sites and health facilities.
+        The exact numbers depend on the OSM import; we just verify the
+        plumbing works end-to-end.
+        """
+        from app.db_client import fetch_amenities
+        amenities = await fetch_amenities(27.9954, 83.2253, 10000)
+        assert len(amenities) > 0, "Expected at least some amenities near Chhatradev"
+
+        cats = {a["category"] for a in amenities}
+        assert "evacuation_sites" in cats, "Expected evacuation sites (schools, temples, etc.)"
+        assert "health" in cats, "Expected at least one health facility"
+
+        # Every returned item must have lat/lon
+        for a in amenities:
+            assert isinstance(a["lat"], float)
+            assert isinstance(a["lon"], float)
+
+    @_DB_SKIP
+    async def test_radius_is_respected(self):
+        """A small radius should return fewer amenities than a large one."""
+        from app.db_client import fetch_amenities
+        small = await fetch_amenities(27.9954, 83.2253, 1000)
+        large = await fetch_amenities(27.9954, 83.2253, 10000)
+        assert len(large) >= len(small), (
+            f"Large radius ({len(large)}) should have >= results as small ({len(small)})"
+        )
