@@ -20,6 +20,7 @@ import re
 from typing import Any
 
 import psycopg
+import psycopg.errors
 from psycopg.types import TypeInfo
 from psycopg.types.hstore import register_hstore
 from psycopg_pool import AsyncConnectionPool
@@ -132,6 +133,47 @@ WHERE
         ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
         %s
     )
+    AND ({_AMENITY_FILTER})
+"""
+
+# Area queries: bounding-box (&&) first, then exact ST_Intersects
+_POINTS_AREA_SQL = f"""
+SELECT
+    osm_id,
+    ST_Y(way)          AS lat,
+    ST_X(way)          AS lon,
+    amenity,
+    aeroway,
+    office,
+    shop,
+    name,
+    tags->'healthcare' AS healthcare,
+    tags->'emergency'  AS emergency,
+    tags               AS extra_tags
+FROM planet_osm_point
+WHERE
+    way && ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)
+    AND ST_Intersects(way, ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326))
+    AND ({_AMENITY_FILTER})
+"""
+
+_POLYGONS_AREA_SQL = f"""
+SELECT
+    osm_id,
+    ST_Y(ST_PointOnSurface(way)) AS lat,
+    ST_X(ST_PointOnSurface(way)) AS lon,
+    amenity,
+    aeroway,
+    office,
+    shop,
+    name,
+    tags->'healthcare' AS healthcare,
+    tags->'emergency'  AS emergency,
+    tags               AS extra_tags
+FROM planet_osm_polygon
+WHERE
+    way && ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)
+    AND ST_Intersects(way, ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326))
     AND ({_AMENITY_FILTER})
 """
 
@@ -312,4 +354,49 @@ async def fetch_amenities(lat: float, lon: float, radius_m: int) -> list[dict]:
         "After dedup: %d amenities (%d raw elements)",
         len(amenities), len(elements),
     )
+    return amenities
+
+
+async def fetch_amenities_area(geojson_geom_str: str, timeout_seconds: float = 10.0) -> list[dict]:
+    """
+    Fetch, clean and categorise all disaster-relevant amenities intersecting a GeoJSON area.
+    Sets a 10s statement timeout to avoid DB locks from large polygons.
+    """
+    timeout_ms = int(timeout_seconds * 1000)
+    try:
+        pool = await get_pool()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(f"SET statement_timeout = {timeout_ms};")
+                # Points
+                await cur.execute(_POINTS_AREA_SQL, (geojson_geom_str, geojson_geom_str))
+                point_rows = await cur.fetchall()
+
+                # Polygons
+                await cur.execute(_POLYGONS_AREA_SQL, (geojson_geom_str, geojson_geom_str))
+                poly_rows = await cur.fetchall()
+
+    except psycopg.errors.QueryCanceled as exc:
+        logger.error("Database statement timeout in area query: %s", exc)
+        raise TimeoutError("Area query timed out") from exc
+    except Exception as exc:
+        if getattr(exc, "sqlstate", None) == "57014" or "timeout" in str(exc).lower():
+            logger.error("Database timeout in area query: %s", exc)
+            raise TimeoutError("Area query timed out") from exc
+        logger.error("Database error in area query: %s", exc)
+        raise DBError(f"PostGIS area query failed: {exc}") from exc
+
+    elements: list[dict] = []
+    for row in point_rows:
+        elements.append(_row_to_element(row, "node"))
+    for row in poly_rows:
+        elements.append(_row_to_element(row, "way"))
+
+    logger.info(
+        "Area DB returned %d points + %d polygons before dedup",
+        len(point_rows), len(poly_rows),
+    )
+
+    deduped = deduplicate(elements)
+    amenities = [a for el in deduped if (a := to_amenity_dict(el)) is not None]
     return amenities

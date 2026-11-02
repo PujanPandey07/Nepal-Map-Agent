@@ -877,3 +877,92 @@ class TestPhase1ContractFixes:
         resp = await client.get("/profile?lat=27.704&lon=85.307&invalid_arg=xyz")
         assert resp.status_code == 422
         assert "invalid_arg" in resp.json()["detail"].lower()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 2: Area-based Amenities Tests (T6)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPhase2AmenitiesArea:
+    sample_poly = {
+        "type": "Polygon",
+        "coordinates": [
+            [
+                [85.300, 27.700],
+                [85.315, 27.700],
+                [85.315, 27.715],
+                [85.300, 27.715],
+                [85.300, 27.700],
+            ]
+        ],
+    }
+
+    async def test_amenities_area_valid_polygon(self, client):
+        payload = {"geometry": self.sample_poly}
+        resp = await client.post("/amenities/area", json=payload)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["source"] == "postgis"
+        assert "summary" in data
+        assert "by_category" in data["summary"]
+        assert "by_type" in data["summary"]
+        assert "total" in data["summary"]
+        assert "items" in data
+        assert isinstance(data["items"], list)
+        assert "data_as_of" in data
+
+    async def test_amenities_area_by_local_level_code(self, client):
+        # 55102 is Chhatradev rural municipality
+        payload = {"local_level_code": "55102"}
+        resp = await client.post("/amenities/area", json=payload)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["summary"]["total"] > 0
+        assert "health" in data["summary"]["by_category"]
+        assert "evacuation_sites" in data["summary"]["by_category"]
+
+    async def test_amenities_area_invalid_polygon(self, client):
+        # Invalid geometry type (Point instead of Polygon)
+        payload = {"geometry": {"type": "Point", "coordinates": [85.30, 27.70]}}
+        resp = await client.post("/amenities/area", json=payload)
+        assert resp.status_code == 422
+
+    async def test_amenities_area_empty_result(self, client):
+        # Small polygon in uninhabited coordinates
+        empty_poly = {
+            "type": "Polygon",
+            "coordinates": [
+                [
+                    [86.990, 27.990],
+                    [86.991, 27.990],
+                    [86.991, 27.991],
+                    [86.990, 27.991],
+                    [86.990, 27.990],
+                ]
+            ],
+        }
+        resp = await client.post("/amenities/area", json={"geometry": empty_poly})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["summary"]["total"] == 0
+        assert data["items"] == []
+
+    async def test_amenities_area_top_n_with_proximity(self, client):
+        payload = {
+            "geometry": self.sample_poly,
+            "top_n": 3,
+            "near_lat": 27.7041,
+            "near_lon": 85.3075,
+        }
+        resp = await client.post("/amenities/area", json=payload)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["items"]) <= 3
+        # Summary total should reflect the overall area, not just top_n
+        assert data["summary"]["total"] >= len(data["items"])
+
+    async def test_amenities_area_statement_timeout_simulated(self, client):
+        with patch("app.main.fetch_amenities_area", side_effect=TimeoutError("Statement timed out")):
+            resp = await client.post("/amenities/area", json={"geometry": self.sample_poly})
+            assert resp.status_code in (504, 502)
+

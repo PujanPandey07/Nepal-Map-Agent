@@ -1,17 +1,29 @@
 # services/geo-data/app/main.py
 import asyncio
+import json
 import logging
+import math
 import os
 import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from shapely.geometry import shape
 from tlf_geo_profiler import profile_dict
 
 from app import config
-from app.db_client import DBError, close_pool, fetch_amenities, get_data_as_of, init_pool
-from app.models import AmenitiesResponse, HealthResponse, ProfileResponse, ResolveResponse
+from app.admin_matcher import get_polygon_for_local_level
+from app.db_client import DBError, close_pool, fetch_amenities, fetch_amenities_area, get_data_as_of, init_pool
+from app.models import (
+    AmenitiesResponse,
+    AreaAmenitiesRequest,
+    AreaAmenitiesResponse,
+    AreaSummary,
+    HealthResponse,
+    ProfileResponse,
+    ResolveResponse,
+)
 from app.resolve_client import ResolveError, parse_candidates, pick_best, resolve_place, resolve_query
 
 # psycopg (async) requires SelectorEventLoop on Windows; uvicorn defaults to
@@ -58,7 +70,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in _origins if o.strip()],
     allow_credentials=True,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -204,4 +216,100 @@ async def get_amenities(
         "data_warning": DATA_WARNING,
         "categories": categories,
         "totals": totals,
+    }
+
+
+def _haversine_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in metres between two coordinates."""
+    r = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2.0) ** 2
+    return 2.0 * r * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+
+
+@app.post("/amenities/area", response_model=AreaAmenitiesResponse)
+async def post_amenities_area(request: Request, body: AreaAmenitiesRequest):
+    """
+    All disaster-relevant amenities within a polygon or local level boundary.
+
+    Accepts either an explicit GeoJSON Polygon/MultiPolygon or a local_level_code.
+    Returns category summary, feature type breakdown, and amenities list.
+    Supports top_n limiting and proximity sorting via near_lat / near_lon.
+    """
+    validate_query_params(request, set())
+
+    # Resolve geometry from local_level_code if requested
+    geom_dict = body.geometry
+    if body.local_level_code:
+        try:
+            geom_dict = get_polygon_for_local_level(body.local_level_code)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    # Validate geometry
+    try:
+        s_geom = shape(geom_dict)
+        if not s_geom.is_valid:
+            s_geom = s_geom.buffer(0)
+            if not s_geom.is_valid:
+                raise ValueError("Invalid polygon geometry")
+        minx, miny, maxx, maxy = s_geom.bounds
+        if minx < -180 or maxx > 180 or miny < -90 or maxy > 90:
+            raise ValueError("Coordinates must be within EPSG:4326")
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid geometry: {exc}")
+
+    geojson_str = json.dumps(geom_dict)
+
+    try:
+        amenities = await fetch_amenities_area(geojson_str, timeout_seconds=10.0)
+    except TimeoutError as exc:
+        logger.error("Area amenities timeout: %s", exc)
+        raise HTTPException(status_code=504, detail="Area query timed out after 10s")
+    except DBError as exc:
+        logger.error("Area amenities database error: %s", exc)
+        raise HTTPException(status_code=502, detail="Spatial database query failed")
+
+    # Aggregate area statistics
+    by_category: dict[str, int] = {cat: 0 for cat in CATEGORY_ORDER}
+    by_type: dict[str, int] = {}
+    for item in amenities:
+        cat = item.get("category", "other")
+        if cat not in by_category:
+            cat = "other"
+        by_category[cat] = by_category.get(cat, 0) + 1
+        t = item.get("type", "other")
+        by_type[t] = by_type.get(t, 0) + 1
+
+    summary = {
+        "total": len(amenities),
+        "by_category": by_category,
+        "by_type": by_type,
+    }
+
+    # Proximity sorting and top_n truncation
+    items = list(amenities)
+    if body.top_n is not None:
+        if body.near_lat is not None and body.near_lon is not None:
+            items.sort(
+                key=lambda a: _haversine_distance_m(
+                    body.near_lat, body.near_lon, a["lat"], a["lon"]
+                )
+            )
+        items = items[: body.top_n]
+
+    data_as_of = await get_data_as_of()
+
+    return {
+        "source": "postgis",
+        "data_as_of": data_as_of,
+        "data_warning": DATA_WARNING,
+        "summary": summary,
+        "items": items,
+        "top_n": body.top_n,
+        "near_lat": body.near_lat,
+        "near_lon": body.near_lon,
     }

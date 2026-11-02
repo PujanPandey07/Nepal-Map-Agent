@@ -4,7 +4,7 @@ Pydantic schemas for the geo-data service response models.
 Ensures clean, self-documenting OpenAPI schemas at /docs.
 """
 from typing import Any, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
@@ -116,3 +116,44 @@ class AmenitiesResponse(BaseModel):
     data_warning: str = Field(..., description="Grounding warning regarding rural OSM completeness")
     categories: dict[str, list[AmenityItem]] = Field(..., description="Amenities grouped by category")
     totals: dict[str, int] = Field(..., description="Count of amenities in each category")
+
+
+# ── Area Amenities ────────────────────────────────────────────────────────────
+
+class AreaAmenitiesRequest(BaseModel):
+    geometry: Optional[dict[str, Any]] = Field(None, description="GeoJSON Polygon or MultiPolygon in EPSG:4326")
+    local_level_code: Optional[str] = Field(None, description="Official local level code (e.g. '55102')")
+    top_n: Optional[int] = Field(None, ge=1, le=1000, description="Optional cap on returned amenities")
+    near_lat: Optional[float] = Field(None, ge=-90, le=90, description="Latitude to sort results by proximity")
+    near_lon: Optional[float] = Field(None, ge=-180, le=180, description="Longitude to sort results by proximity")
+
+    @model_validator(mode="after")
+    def validate_one_of(self):
+        if not self.geometry and not self.local_level_code:
+            raise ValueError("Must provide either 'geometry' or 'local_level_code'")
+        if self.geometry and self.local_level_code:
+            raise ValueError("Must provide either 'geometry' or 'local_level_code', not both")
+        if self.geometry:
+            g_type = self.geometry.get("type")
+            if g_type not in ("Polygon", "MultiPolygon"):
+                raise ValueError("Geometry must be a Polygon or MultiPolygon")
+            if "coordinates" not in self.geometry or not self.geometry["coordinates"]:
+                raise ValueError("Geometry must contain coordinates")
+        return self
+
+
+class AreaSummary(BaseModel):
+    total: int = Field(..., description="Total count of amenities in the area")
+    by_category: dict[str, int] = Field(..., description="Count of amenities per disaster category")
+    by_type: dict[str, int] = Field(..., description="Count of amenities per specific feature type")
+
+
+class AreaAmenitiesResponse(BaseModel):
+    source: str = Field("postgis", description="Data source")
+    data_as_of: str = Field(..., description="Date of the imported OSM snapshot")
+    data_warning: str = Field(..., description="Grounding warning regarding rural OSM completeness")
+    summary: AreaSummary = Field(..., description="Summary statistics of amenities in the area")
+    items: list[AmenityItem] = Field(..., description="List of amenities matching the area")
+    top_n: Optional[int] = Field(None, description="Requested top_n limit, if any")
+    near_lat: Optional[float] = Field(None, description="Proximity sort center latitude, if provided")
+    near_lon: Optional[float] = Field(None, description="Proximity sort center longitude, if provided")

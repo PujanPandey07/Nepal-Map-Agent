@@ -13,6 +13,7 @@ import logging
 from typing import Optional
 
 import pandas as pd
+import shapely.geometry
 import tlf_geo
 from tlf_geo_profiler import boundaries
 
@@ -148,3 +149,28 @@ def match_admin_unit(query: str) -> Optional[dict]:
         "source": "tlf-geo",
         "address": address_info,
     }
+
+
+def get_polygon_for_local_level(code: str) -> dict:
+    """
+    Look up local level polygon boundary by official CBS/LGD code.
+    Returns GeoJSON geometry dict.
+    Raises ValueError if code cannot be resolved or geometry is not found.
+    """
+    r = _get_resolver()
+    info = r.get_by_code(code)
+    if not info:
+        raise ValueError(f"Unknown local level code: {code}")
+    name = info.get("name")
+    if not name:
+        raise ValueError(f"Could not determine name for local level code: {code}")
+
+    gdf = _get_gdf("local_levels")
+    matches = gdf[gdf["name_en"].str.lower() == str(name).lower()]
+    if matches.empty:
+        matches = gdf[gdf["name_en"].str.lower().str.contains(str(name).lower())]
+    if matches.empty:
+        raise ValueError(f"No boundary polygon found for local level: {name}")
+
+    geom = matches.iloc[0]["geometry"]
+    return shapely.geometry.mapping(geom)
