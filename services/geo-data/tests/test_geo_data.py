@@ -788,3 +788,92 @@ class TestDbClientIntegration:
         assert len(large) >= len(small), (
             f"Large radius ({len(large)}) should have >= results as small ({len(small)})"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 1: Contract Fixes Tests (T1 - T5)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPhase1ContractFixes:
+    async def test_ambiguous_durbar_square_contract(self, client):
+        resp = await client.get("/resolve?q=Durbar Square")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ambiguous"] is True
+        assert data["best_match"] is None
+        assert data["clarification_needed"] is True
+        assert "options" in data
+        assert len(data["options"]) == 3
+        assert "data_as_of" in data
+        for opt in data["options"]:
+            assert "id" in opt
+            assert "label" in opt
+            assert "lat" in opt
+            assert "lon" in opt
+            assert len(opt["label"]) > 5
+
+    async def test_non_ambiguous_ebc_contract(self, client):
+        resp = await client.get("/resolve?q=EBC")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ambiguous"] is False
+        assert data["best_match"] is not None
+        assert data["clarification_needed"] is False
+        assert data["options"] == []
+        assert "data_as_of" in data
+        # Check admin context enrichment
+        c = data["best_match"]
+        assert c.get("district") is not None
+        assert c.get("province") is not None
+
+    async def test_mocked_nominatim_with_nan_fields_enrichment(self, client):
+        import numpy as np
+        raw_nominatim_with_nan = [
+            {
+                "display_name": "Test Village, Nepal",
+                "lat": "27.7041",
+                "lon": "85.3075",
+                "type": "village",
+                "class": "place",
+                "importance": 0.5,
+                "address": {
+                    "village": "Test Village",
+                    "district": np.nan,
+                    "country": "Nepal",
+                },
+                "namedetails": {"name": "Test Village"},
+            },
+            {
+                "display_name": "Second Village, Nepal",
+                "lat": "27.6734",
+                "lon": "85.3250",
+                "type": "village",
+                "class": "place",
+                "importance": 0.49,
+                "address": {"village": "Second Village"},
+                "namedetails": {"name": "Second Village"},
+            },
+        ]
+        with patch("app.resolve_client.resolve_place", new=AsyncMock(return_value=raw_nominatim_with_nan)):
+            resp = await client.get("/resolve?q=TestAmbiguousQueryXYZ")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ambiguous"] is True
+        assert data["best_match"] is None
+        assert data["clarification_needed"] is True
+        assert len(data["options"]) == 2
+
+    async def test_unknown_query_param_amenities_returns_422(self, client):
+        resp = await client.get("/amenities?lat=27.704&lon=85.307&radius=5000")
+        assert resp.status_code == 422
+        assert "radius" in resp.json()["detail"].lower()
+
+    async def test_unknown_query_param_resolve_returns_422(self, client):
+        resp = await client.get("/resolve?q=Kathmandu&extra_param=val")
+        assert resp.status_code == 422
+        assert "extra_param" in resp.json()["detail"].lower()
+
+    async def test_unknown_query_param_profile_returns_422(self, client):
+        resp = await client.get("/profile?lat=27.704&lon=85.307&invalid_arg=xyz")
+        assert resp.status_code == 422
+        assert "invalid_arg" in resp.json()["detail"].lower()

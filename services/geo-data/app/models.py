@@ -43,13 +43,30 @@ class Candidate(BaseModel):
     importance: float = Field(..., description="Relevance score (0.0 to 1.0)")
     address: CandidateAddress = Field(default_factory=CandidateAddress, description="Address breakdown")
     source: Optional[str] = Field(None, description="Resolver tier source: curated, tlf-geo, or nominatim")
+    province: Optional[str] = Field(None, description="Province name")
+    district: Optional[str] = Field(None, description="District name")
+    local_level: Optional[str] = Field(None, description="Local level name")
+    local_level_type: Optional[str] = Field(None, description="Local level type")
+    ward: Optional[int] = Field(None, description="Ward number")
+
+    model_config = {"extra": "allow"}
+
+
+class ResolveOption(BaseModel):
+    id: str = Field(..., description="Option identifier")
+    label: str = Field(..., description="Human-readable place label with administrative context")
+    lat: float = Field(..., description="Latitude")
+    lon: float = Field(..., description="Longitude")
 
 
 class ResolveResponse(BaseModel):
     query: str = Field(..., description="Search query string")
     ambiguous: bool = Field(..., description="True if top candidates had similar scores and user should disambiguate")
-    best_match: Optional[Candidate] = Field(None, description="Top ranked candidate, or null if no matches")
+    best_match: Optional[Candidate] = Field(None, description="Top ranked candidate, or null if ambiguous or no matches")
     candidates: list[Candidate] = Field(default_factory=list, description="All matching candidates")
+    clarification_needed: bool = Field(False, description="True if ambiguity requires user clarification")
+    options: list[ResolveOption] = Field(default_factory=list, description="Options for disambiguation")
+    data_as_of: Optional[str] = Field(None, description="Date of the imported OSM data snapshot (YYYY-MM-DD)")
 
 
 # ── Profile ───────────────────────────────────────────────────────────────────

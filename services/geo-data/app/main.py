@@ -5,12 +5,12 @@ import os
 import sys
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from tlf_geo_profiler import profile_dict
 
 from app import config
-from app.db_client import DBError, close_pool, fetch_amenities, init_pool
+from app.db_client import DBError, close_pool, fetch_amenities, get_data_as_of, init_pool
 from app.models import AmenitiesResponse, HealthResponse, ProfileResponse, ResolveResponse
 from app.resolve_client import ResolveError, parse_candidates, pick_best, resolve_place, resolve_query
 
@@ -63,6 +63,18 @@ app.add_middleware(
 )
 
 
+# ── validation helper ────────────────────────────────────────────────────────
+
+def validate_query_params(request: Request, allowed: set[str]) -> None:
+    """Ensure no unexpected query parameters were passed (e.g. typos)."""
+    unknown = set(request.query_params.keys()) - allowed
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown query parameter(s): {', '.join(sorted(unknown))}",
+        )
+
+
 # ── testable helper (makes mocking profile_dict easy in tests) ───────────────
 
 async def _call_profile_dict(lat: float, lon: float) -> dict:
@@ -73,12 +85,15 @@ async def _call_profile_dict(lat: float, lon: float) -> dict:
 # ── endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/health", response_model=HealthResponse)
-async def health():
-    return {"status": "ok", "data_as_of": config.DATA_AS_OF}
+async def health(request: Request):
+    validate_query_params(request, set())
+    data_as_of = await get_data_as_of()
+    return {"status": "ok", "data_as_of": data_as_of}
 
 
 @app.get("/resolve", response_model=ResolveResponse)
 async def get_resolve(
+    request: Request,
     q: str = Query(..., min_length=1, description="Nepal place name to look up"),
 ):
     """
@@ -89,8 +104,11 @@ async def get_resolve(
       2. Administrative geography (77 districts, 753 local levels via tlf-geo boundaries)
       3. Nominatim geocoding with category reranking
     """
+    validate_query_params(request, {"q"})
     try:
-        return await resolve_query(q)
+        res = await resolve_query(q)
+        res["data_as_of"] = await get_data_as_of()
+        return res
     except ResolveError as e:
         logger.error("Resolve error: %s", e)
         raise HTTPException(status_code=502, detail="Geocoding service unavailable")
@@ -98,6 +116,7 @@ async def get_resolve(
 
 @app.get("/profile", response_model=ProfileResponse)
 async def get_profile(
+    request: Request,
     lat: float = Query(..., ge=-90, le=90, description="Latitude"),
     lon: float = Query(..., ge=-180, le=180, description="Longitude"),
 ):
@@ -109,6 +128,7 @@ async def get_profile(
     (no ward polygon, unresolved local level, or no demographics); *notes*
     explains what is missing.  Missing means unknown, not zero.
     """
+    validate_query_params(request, {"lat", "lon"})
     try:
         data = await _call_profile_dict(lat, lon)
     except ValueError:
@@ -136,6 +156,7 @@ async def get_profile(
 
 @app.get("/amenities", response_model=AmenitiesResponse)
 async def get_amenities(
+    request: Request,
     lat: float = Query(..., ge=-90, le=90),
     lon: float = Query(..., ge=-180, le=180),
     radius_m: int = Query(
@@ -158,6 +179,7 @@ async def get_amenities(
     Results are deduplicated (node + way for the same building counted once)
     and cached for 10 minutes.  *data_warning* must be surfaced to users.
     """
+    validate_query_params(request, {"lat", "lon", "radius_m"})
     try:
         amenities = await fetch_amenities(lat, lon, radius_m)
     except DBError as e:
@@ -173,10 +195,11 @@ async def get_amenities(
         categories[cat].append(item)
 
     totals = {cat: len(items) for cat, items in categories.items()}
+    data_as_of = await get_data_as_of()
 
     return {
         "source": "postgis",
-        "data_as_of": config.DATA_AS_OF,
+        "data_as_of": data_as_of,
         "radius_m": radius_m,
         "data_warning": DATA_WARNING,
         "categories": categories,

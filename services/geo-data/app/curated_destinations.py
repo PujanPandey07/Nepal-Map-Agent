@@ -157,7 +157,7 @@ FAMOUS_DESTINATIONS = [
         "lat": 27.7041,
         "lon": 85.3075,
         "district": "Kathmandu",
-        "aliases": ["durbar square", "darbar square", "kathmandu durbar square", "basantapur", "basantapur durbar square", "hanuman dhoka"],
+        "aliases": ["durbar square", "darbar square", "kathmandu durbar square", "basantapur durbar square", "hanuman dhoka"],
     },
     {
         "short_name": "Patan Durbar Square",
@@ -477,7 +477,10 @@ def match_destinations(query: str) -> list[dict]:
 def match_destination(query: str) -> dict | None:
     """
     Look up a query against the curated destinations table.
-    Returns first matching destination dict if matched, None otherwise.
+    Neutralized: returns destination only if there is exactly ONE match;
+    returns None if ambiguous (multiple matches) or no match.
     """
     matches = match_destinations(query)
-    return matches[0] if matches else None
+    if len(matches) == 1:
+        return matches[0]
+    return None

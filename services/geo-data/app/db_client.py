@@ -194,6 +194,7 @@ def _row_to_element(row: dict[str, Any], element_type: str) -> dict:
 # ── connection pool ──────────────────────────────────────────────────────────
 
 _pool: AsyncConnectionPool | None = None
+_data_as_of: str | None = None
 
 
 async def _configure_connection(conn: psycopg.AsyncConnection) -> None:
@@ -233,6 +234,33 @@ async def get_pool() -> AsyncConnectionPool:
     if _pool is None:
         return await init_pool()
     return _pool
+
+
+async def get_data_as_of() -> str:
+    """
+    Return data snapshot date from osm2pgsql_properties table if present,
+    otherwise fallback to config.DATA_AS_OF.
+    """
+    global _data_as_of
+    if _data_as_of is not None:
+        return _data_as_of
+    try:
+        pool = await get_pool()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT value FROM osm2pgsql_properties WHERE property = 'replication_timestamp' OR property = 'import_timestamp' ORDER BY property DESC LIMIT 1;"
+                )
+                row = await cur.fetchone()
+                if row and row[0]:
+                    val = str(row[0]).strip()
+                    date_part = val.split("T")[0]
+                    _data_as_of = date_part
+                    return _data_as_of
+    except Exception as e:
+        logger.debug("Could not read osm2pgsql_properties: %s", e)
+    _data_as_of = config.DATA_AS_OF
+    return _data_as_of
 
 
 # ── main public function ──────────────────────────────────────────────────────

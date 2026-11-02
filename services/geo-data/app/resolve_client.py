@@ -13,10 +13,13 @@ Tier 3: Live Nominatim (OSM geocoder) with category reranking
 """
 import asyncio
 import logging
+import math
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
+import pandas as pd
+from tlf_geo_profiler import profile_dict
 
 from app.admin_matcher import match_admin_unit
 from app.curated_destinations import match_destination, match_destinations
@@ -131,6 +134,109 @@ async def resolve_place(q: str, limit: int = 5) -> list[dict]:
     return data
 
 
+def _sanitize_val(v: Any) -> Any:
+    """Safely return None if v is None, NaN or empty."""
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    if isinstance(v, float) and math.isnan(v):
+        return None
+    return v
+
+
+def _clean_str(v: Any) -> Optional[str]:
+    v = _sanitize_val(v)
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s else None
+
+
+def _clean_int(v: Any) -> Optional[int]:
+    v = _sanitize_val(v)
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        return None
+
+
+def enrich_candidate(cand: dict) -> dict:
+    """
+    Enrich a candidate dict with admin context from the offline profiler:
+    province, district, local_level, local_level_type, ward.
+    None-safe: NaN/missing values become None (never JSON NaN).
+    """
+    cand.setdefault("province", None)
+    cand.setdefault("district", None)
+    cand.setdefault("local_level", None)
+    cand.setdefault("local_level_type", None)
+    cand.setdefault("ward", None)
+
+    # Sanitize address dictionary
+    if "address" in cand and isinstance(cand["address"], dict):
+        cand["address"] = {
+            k: _clean_str(v)
+            for k, v in cand["address"].items()
+        }
+
+    lat = cand.get("lat")
+    lon = cand.get("lon")
+    if lat is None or lon is None:
+        return cand
+
+    try:
+        f_lat = float(lat)
+        f_lon = float(lon)
+        prof = profile_dict(f_lat, f_lon)
+        if prof and isinstance(prof, dict):
+            admin = prof.get("admin_unit") or {}
+            cand["province"] = _clean_str(admin.get("province")) or cand.get("province")
+            cand["district"] = _clean_str(admin.get("district")) or cand.get("district")
+            cand["local_level"] = _clean_str(admin.get("local_level")) or cand.get("local_level")
+            cand["local_level_type"] = _clean_str(admin.get("local_level_type")) or cand.get("local_level_type")
+            cand["ward"] = _clean_int(admin.get("ward")) if cand.get("ward") is None else cand.get("ward")
+    except Exception as exc:
+        logger.debug("Profile enrichment error for (%s, %s): %s", lat, lon, exc)
+
+    return cand
+
+
+def make_candidate_label(cand: dict) -> str:
+    """
+    Construct a human-readable disambiguation label,
+    e.g. "Basantapur, Rapti rural municipality, Dang".
+    """
+    name = cand.get("short_name") or cand.get("name") or "Unknown"
+    parts = [str(name).strip()]
+    loc = cand.get("local_level")
+    loc_type = cand.get("local_level_type")
+    dist = cand.get("district") or (cand.get("address") or {}).get("district")
+
+    if loc:
+        loc_str = str(loc).strip()
+        if loc_type:
+            loc_type_str = str(loc_type).replace("_", " ").strip()
+            if loc_type_str.lower() not in loc_str.lower():
+                parts.append(f"{loc_str} {loc_type_str}")
+            else:
+                parts.append(loc_str)
+        else:
+            parts.append(loc_str)
+
+    if dist:
+        dist_str = str(dist).strip()
+        if dist_str.lower() not in parts[0].lower() and (len(parts) < 2 or dist_str.lower() not in parts[1].lower()):
+            parts.append(dist_str)
+
+    return ", ".join(parts)
+
+
 def parse_candidates(raw: list[dict]) -> list[dict]:
     """
     Convert raw Nominatim results into candidate shapes and rerank them:
@@ -138,24 +244,26 @@ def parse_candidates(raw: list[dict]) -> list[dict]:
     """
     candidates = []
     for r in raw:
-        addr = r.get("address", {})
-        name_details = r.get("namedetails", {})
+        addr = r.get("address", {}) or {}
+        name_details = r.get("namedetails", {}) or {}
         short_name = (
-            name_details.get("name:en")
-            or name_details.get("name")
-            or r.get("name", "")
+            _clean_str(name_details.get("name:en"))
+            or _clean_str(name_details.get("name"))
+            or _clean_str(r.get("name"))
+            or ""
         )
         candidates.append({
-            "name": r.get("display_name", ""),
+            "name": _clean_str(r.get("display_name")) or "",
             "short_name": short_name,
-            "type": r.get("type", ""),
-            "osm_class": r.get("class", ""),
+            "type": _clean_str(r.get("type")) or "",
+            "osm_class": _clean_str(r.get("class")) or "",
             "lat": float(r["lat"]),
             "lon": float(r["lon"]),
             "importance": float(r.get("importance", 0.0)),
             "source": "nominatim",
             "address": {
-                k: v for k, v in addr.items()
+                k: _clean_str(v)
+                for k, v in addr.items()
                 if k in ("state", "district", "city", "town",
                          "village", "suburb", "road", "postcode", "country")
             },
@@ -200,7 +308,7 @@ async def resolve_query(q: str) -> dict:
     dests = match_destinations(clean_q)
     if dests:
         candidates = [
-            {
+            enrich_candidate({
                 "name": f"{dest['short_name']}, {dest.get('district', '')}, Nepal".strip(", "),
                 "short_name": dest["short_name"],
                 "type": dest["type"],
@@ -213,35 +321,69 @@ async def resolve_query(q: str) -> dict:
                     "district": dest.get("district"),
                     "country": "Nepal",
                 },
-            }
+            })
             for dest in dests
         ]
         is_ambiguous = len(candidates) > 1
+        options = (
+            [
+                {
+                    "id": str(idx + 1),
+                    "label": make_candidate_label(c),
+                    "lat": c["lat"],
+                    "lon": c["lon"],
+                }
+                for idx, c in enumerate(candidates)
+            ]
+            if is_ambiguous
+            else []
+        )
         return {
             "query": q,
             "ambiguous": is_ambiguous,
-            "best_match": candidates[0],
+            "best_match": None if is_ambiguous else candidates[0],
             "candidates": candidates,
+            "clarification_needed": is_ambiguous,
+            "options": options,
         }
 
     # ── Tier 2: Administrative Geography (tlf-geo + boundaries) ──────────────
     admin = match_admin_unit(clean_q)
     if admin:
+        enriched_admin = enrich_candidate(admin)
         return {
             "query": q,
             "ambiguous": False,
-            "best_match": admin,
-            "candidates": [admin],
+            "best_match": enriched_admin,
+            "candidates": [enriched_admin],
+            "clarification_needed": False,
+            "options": [],
         }
 
     # ── Tier 3: Nominatim Live Geocoding ─────────────────────────────────────
     raw = await resolve_place(clean_q)
-    candidates = parse_candidates(raw)
+    candidates = [enrich_candidate(c) for c in parse_candidates(raw)]
     best, ambiguous = pick_best(candidates)
+
+    options = (
+        [
+            {
+                "id": str(idx + 1),
+                "label": make_candidate_label(c),
+                "lat": c["lat"],
+                "lon": c["lon"],
+            }
+            for idx, c in enumerate(candidates)
+        ]
+        if ambiguous
+        else []
+    )
 
     return {
         "query": q,
         "ambiguous": ambiguous,
-        "best_match": best,
+        "best_match": None if ambiguous else best,
         "candidates": candidates,
+        "clarification_needed": ambiguous,
+        "options": options,
     }
