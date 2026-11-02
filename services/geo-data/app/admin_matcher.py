@@ -12,10 +12,18 @@ completely eliminating reliance on external geocoders for administrative geograp
 import logging
 from typing import Optional
 
+import pandas as pd
 import tlf_geo
 from tlf_geo_profiler import boundaries
 
 logger = logging.getLogger("geo-data.admin")
+
+
+def _clean_val(val):
+    """Return None if val is missing (pandas NaN/NA/None), otherwise val."""
+    if pd.isna(val):
+        return None
+    return val
 
 _resolver: Optional[tlf_geo.GeoResolver] = None
 _districts_gdf = None
@@ -90,35 +98,41 @@ def match_admin_unit(query: str) -> Optional[dict]:
         # Match by name_en (case-insensitive) or canonical
         matches = gdf[gdf["name_en"].str.lower() == canonical_key.lower()]
         if not matches.empty:
-            geom = matches.iloc[0]["geometry"]
+            row = matches.iloc[0]
+            geom = row["geometry"]
             c = geom.centroid
             coords = (float(c.y), float(c.x))
-            display_name = f"{matches.iloc[0]['name_en']} District, Nepal"
-            address_info["district"] = matches.iloc[0]["name_en"]
-            address_info["name_ne"] = matches.iloc[0].get("name_ne")
+            district_name = _clean_val(row.get("name_en"))
+            display_name = f"{district_name} District, Nepal" if district_name else f"{canonical_key.title()} District, Nepal"
+            address_info["district"] = district_name
+            address_info["name_ne"] = _clean_val(row.get("name_ne"))
 
     elif any(k in level_str for k in ("municipality", "gaunpalika", "metropolitan")):
         gdf = _get_gdf("local_levels")
         matches = gdf[gdf["name_en"].str.lower() == canonical_key.lower()]
         if not matches.empty:
-            geom = matches.iloc[0]["geometry"]
+            row = matches.iloc[0]
+            geom = row["geometry"]
             c = geom.centroid
             coords = (float(c.y), float(c.x))
-            display_name = f"{matches.iloc[0]['name_en']}, Nepal"
-            address_info["city"] = matches.iloc[0]["name_en"]
-            address_info["type"] = matches.iloc[0].get("kind")
-            address_info["name_ne"] = matches.iloc[0].get("name_ne")
+            city_name = _clean_val(row.get("name_en"))
+            display_name = f"{city_name}, Nepal" if city_name else f"{canonical_key.title()}, Nepal"
+            address_info["city"] = city_name
+            address_info["type"] = _clean_val(row.get("kind"))
+            address_info["name_ne"] = _clean_val(row.get("name_ne"))
 
     elif "province" in level_str:
         gdf = _get_gdf("provinces")
         matches = gdf[gdf["name_en"].str.lower().str.contains(canonical_key.lower())]
         if not matches.empty:
-            geom = matches.iloc[0]["geometry"]
+            row = matches.iloc[0]
+            geom = row["geometry"]
             c = geom.centroid
             coords = (float(c.y), float(c.x))
-            display_name = f"{matches.iloc[0]['name_en']}, Nepal"
-            address_info["state"] = matches.iloc[0]["name_en"]
-            address_info["name_ne"] = matches.iloc[0].get("name_ne")
+            state_name = _clean_val(row.get("name_en"))
+            display_name = f"{state_name}, Nepal" if state_name else f"{canonical_key.title()}, Nepal"
+            address_info["state"] = state_name
+            address_info["name_ne"] = _clean_val(row.get("name_ne"))
 
     if coords is None:
         return None

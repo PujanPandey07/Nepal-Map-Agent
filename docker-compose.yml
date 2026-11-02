@@ -1,0 +1,24 @@
+services:
+  postgis:
+    # Postgres 18 with PostGIS 3.6 preinstalled. Pinned to a tag so it
+    # doesn't change under you when a newer image is published.
+    image: postgis/postgis:18-3.6
+    container_name: nepal-postgis # clear name, since you now have two Postgres containers
+    environment:
+      # Docker substitutes these from the .env file next to this one
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      # left side = your laptop, right side = inside the container.
+      # Your other Postgres owns 5432, so we use 5433 outside.
+      - "5433:5432"
+    volumes:
+      # Named volume so the imported data survives container removal.
+      # Postgres 18+ images use /var/lib/postgresql (older ones used
+      # /var/lib/postgresql/data), so don't copy older examples blindly.
+      - osm_pgdata:/var/lib/postgresql
+    restart: unless-stopped
+
+volumes:
+  osm_pgdata:

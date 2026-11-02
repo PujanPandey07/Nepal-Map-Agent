@@ -555,3 +555,36 @@ class TestResolveEndpoint:
         assert data["ambiguous"] is False
         assert data["best_match"]["short_name"] == "Gorkha"
         assert data["best_match"]["source"] == "tlf-geo"
+
+    async def test_admin_unit_chhatradev_nan_name_ne_returns_null(self, client):
+        resp = await client.get("/resolve?q=Chhatradev")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ambiguous"] is False
+        assert data["best_match"]["short_name"] == "Chhatradev"
+        assert data["best_match"]["address"]["name_ne"] is None
+
+    def test_admin_matcher_handles_nan_in_row(self):
+        import numpy as np
+        import pandas as pd
+        from shapely.geometry import Point
+        from unittest.mock import patch, MagicMock
+        from app.admin_matcher import match_admin_unit
+
+        fake_gdf = pd.DataFrame([{
+            "name_en": "TestPlace",
+            "name_ne": np.nan,
+            "kind": np.nan,
+            "geometry": Point(85.3, 27.7),
+        }])
+
+        mock_resolver = MagicMock()
+        mock_resolver.search.return_value = [("testplace (municipality)", 100.0)]
+
+        with patch("app.admin_matcher._get_resolver", return_value=mock_resolver), \
+             patch("app.admin_matcher._get_gdf", return_value=fake_gdf):
+            result = match_admin_unit("TestPlace")
+            assert result is not None
+            assert result["address"]["name_ne"] is None
+            assert result["address"]["type"] is None
+            assert result["address"]["city"] == "TestPlace"
