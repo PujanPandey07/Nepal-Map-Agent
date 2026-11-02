@@ -740,7 +740,9 @@ import os as _os
 def _db_available() -> bool:
     """Return True if the PostGIS container is reachable."""
     import socket
-    host = _os.getenv("DB_HOST", "localhost")
+    host = _os.getenv("DB_HOST", "127.0.0.1")
+    if host == "localhost":
+        host = "127.0.0.1"
     port = int(_os.getenv("DB_PORT", "5433"))
     try:
         with socket.create_connection((host, port), timeout=2):

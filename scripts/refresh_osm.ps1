@@ -11,7 +11,9 @@
 
 param(
     [string]$DownloadUrl = "https://download.geofabrik.de/asia/nepal-latest.osm.pbf",
-    [switch]$SkipDownload = $false
+    [switch]$SkipDownload = $false,
+    [string]$TargetDb = "nepal_osm_next",
+    [switch]$TestOnly = $false
 )
 
 $ErrorActionPreference = "Stop"
@@ -66,6 +68,12 @@ if (-not $SkipDownload) {
         throw "Failed to download $DownloadUrl"
     }
 } else {
+    if (-not (Test-Path $PbfFile)) {
+        $existing = Get-ChildItem -Path $DataDir -Filter "*.osm.pbf" | Select-Object -First 1
+        if ($existing) {
+            $PbfFile = $existing.FullName
+        }
+    }
     Write-Host "`n[1/6] Skipping download as requested. Using existing: $PbfFile" -ForegroundColor Yellow
 }
 
@@ -73,16 +81,18 @@ if (-not (Test-Path $PbfFile)) {
     throw "PBF file not found at $PbfFile"
 }
 
-# ── Step b: Create temporary database nepal_osm_next ──────────────────────────
-Write-Host "`n[2/6] Preparing nepal_osm_next database..." -ForegroundColor Yellow
+$PbfFileName = Split-Path -Leaf $PbfFile
 
-docker exec nepal-postgis psql -U $DbUser -d postgres -c "DROP DATABASE IF EXISTS nepal_osm_next;"
-docker exec nepal-postgis psql -U $DbUser -d postgres -c "CREATE DATABASE nepal_osm_next;"
-docker exec nepal-postgis psql -U $DbUser -d nepal_osm_next -c "CREATE EXTENSION IF NOT EXISTS postgis;"
-docker exec nepal-postgis psql -U $DbUser -d nepal_osm_next -c "CREATE EXTENSION IF NOT EXISTS hstore;"
+# ── Step b: Create temporary database $TargetDb ──────────────────────────
+Write-Host "`n[2/6] Preparing $TargetDb database..." -ForegroundColor Yellow
 
-# ── Step c: Run osm2pgsql import into nepal_osm_next ──────────────────────────
-Write-Host "`n[3/6] Running osm2pgsql import into nepal_osm_next..." -ForegroundColor Yellow
+docker exec nepal-postgis psql -U $DbUser -d postgres -c "DROP DATABASE IF EXISTS $TargetDb;"
+docker exec nepal-postgis psql -U $DbUser -d postgres -c "CREATE DATABASE $TargetDb;"
+docker exec nepal-postgis psql -U $DbUser -d $TargetDb -c "CREATE EXTENSION IF NOT EXISTS postgis;"
+docker exec nepal-postgis psql -U $DbUser -d $TargetDb -c "CREATE EXTENSION IF NOT EXISTS hstore;"
+
+# ── Step c: Run osm2pgsql import into $TargetDb ──────────────────────────
+Write-Host "`n[3/6] Running osm2pgsql import into $TargetDb..." -ForegroundColor Yellow
 
 docker run --rm `
     --network nepal-map-agent_default `
@@ -90,8 +100,8 @@ docker run --rm `
     -e PGPASSWORD=$DbPassword `
     iboates/osm2pgsql `
     -c -s -l -k `
-    -H nepal-postgis -P 5432 -U $DbUser -d nepal_osm_next `
-    /data/nepal-latest.osm.pbf
+    -H nepal-postgis -P 5432 -U $DbUser -d $TargetDb `
+    "/data/$PbfFileName"
 
 if ($LASTEXITCODE -ne 0) {
     throw "osm2pgsql import failed with exit code $LASTEXITCODE"
@@ -103,7 +113,7 @@ Write-Host "`n[4/6] Running sanity checks on imported data..." -ForegroundColor 
 $oldPointCountRaw = docker exec nepal-postgis psql -U $DbUser -d $DbName -t -c "SELECT count(*) FROM planet_osm_point;"
 $oldPointCount = [int]($oldPointCountRaw.Trim())
 
-$newPointCountRaw = docker exec nepal-postgis psql -U $DbUser -d nepal_osm_next -t -c "SELECT count(*) FROM planet_osm_point;"
+$newPointCountRaw = docker exec nepal-postgis psql -U $DbUser -d $TargetDb -t -c "SELECT count(*) FROM planet_osm_point;"
 $newPointCount = [int]($newPointCountRaw.Trim())
 
 Write-Host "Old DB point count: $oldPointCount"
@@ -117,7 +127,7 @@ if ($newPointCount -lt $minExpected -or $newPointCount -gt $maxExpected) {
 }
 
 # Chhatradev check in new DB
-$chhatradevRaw = docker exec nepal-postgis psql -U $DbUser -d nepal_osm_next -t -c "
+$chhatradevRaw = docker exec nepal-postgis psql -U $DbUser -d $TargetDb -t -c "
     SELECT count(*) FROM planet_osm_point
     WHERE ST_DWithin(way::geography, ST_SetSRID(ST_MakePoint(83.2253,27.9954),4326)::geography, 10000)
       AND (amenity IS NOT NULL OR (tags->'healthcare') IS NOT NULL);
@@ -130,6 +140,12 @@ if ($chhatradevCount -lt 50) {
 }
 
 Write-Host "Sanity checks PASSED!" -ForegroundColor Green
+
+if ($TestOnly) {
+    Write-Host "`n[5/6] TestOnly mode enabled: skipping database swap. Active database '$DbName' was left completely untouched." -ForegroundColor Green
+    Write-Host "`n[6/6] Scratch database '$TargetDb' successfully tested and verified!" -ForegroundColor Green
+    return
+}
 
 # ── Step e: Atomic database swap ──────────────────────────────────────────────
 Write-Host "`n[5/6] Swapping databases (nepal_osm -> nepal_osm_old, nepal_osm_next -> nepal_osm)..." -ForegroundColor Yellow

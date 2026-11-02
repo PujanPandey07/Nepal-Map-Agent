@@ -1,8 +1,28 @@
 """Shared fixtures for geo-data tests."""
+import asyncio
+import sys
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.main import app
+from app.db_client import close_pool
+
+
+@pytest.fixture(scope="session")
+def event_loop_policy():
+    if sys.platform == "win32":
+        return asyncio.WindowsSelectorEventLoopPolicy()
+    return asyncio.DefaultEventLoopPolicy()
+
+
+@pytest.fixture(autouse=True)
+async def cleanup_db_pool():
+    yield
+    await close_pool()
 
 
 @pytest.fixture
