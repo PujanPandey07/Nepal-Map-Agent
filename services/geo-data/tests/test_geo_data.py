@@ -534,6 +534,46 @@ class TestResolveEndpoint:
             resp = await client.get("/resolve?q=UnknownPlaceXYZ")
         assert resp.status_code == 502
 
+
+class TestNominatimFallbackSafety:
+    async def test_nominatim_timeout_raises_resolve_error(self):
+        from app.resolve_client import resolve_place, ResolveError
+        import httpx
+        with patch("httpx.AsyncClient.get", side_effect=httpx.TimeoutException("Read timed out")):
+            with pytest.raises(ResolveError, match="timed out"):
+                await resolve_place("SomeRemoteVillageInTheHills")
+
+    async def test_nominatim_cache_hit_avoids_second_network_call(self):
+        from unittest.mock import MagicMock
+        from app.resolve_client import resolve_place, _nominatim_cache
+        _nominatim_cache.clear()
+        mock_resp = [{"display_name": "Test Place", "lat": "27.5", "lon": "85.5", "importance": 0.5}]
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = mock_resp
+        mock_response.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient.get", new=AsyncMock(return_value=mock_response)) as mock_get:
+            # First call triggers network request
+            res1 = await resolve_place("TestCacheQuery123")
+            assert len(res1) == 1
+            assert mock_get.call_count == 1
+
+            # Second call with same / normalised query — should hit cache
+            res2 = await resolve_place("  testcachequery123  ")
+            assert len(res2) == 1
+            assert mock_get.call_count == 1  # Still 1! No new network call
+
+    async def test_nominatim_rate_limiter_enforces_spacing(self):
+        from app.resolve_client import NominatimRateLimiter
+        import time
+        limiter = NominatimRateLimiter(min_interval=0.05)
+        t0 = time.monotonic()
+        await limiter.acquire()
+        await limiter.acquire()
+        t1 = time.monotonic()
+        assert (t1 - t0) >= 0.045
+
     async def test_clear_winner_not_ambiguous(self, client):
         with patch("app.resolve_client.resolve_place",
                    new=AsyncMock(return_value=NOMINATIM_CLEAR_WINNER)):
@@ -549,6 +589,19 @@ class TestResolveEndpoint:
         assert data["ambiguous"] is False
         assert data["best_match"]["short_name"] == "Everest Base Camp"
         assert data["best_match"]["source"] == "curated"
+
+    async def test_durbar_square_returns_ambiguous_three_candidates(self, client):
+        resp = await client.get("/resolve?q=Durbar Square")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ambiguous"] is True
+        assert len(data["candidates"]) == 3
+        names = {c["short_name"] for c in data["candidates"]}
+        assert "Kathmandu Durbar Square" in names
+        assert "Patan Durbar Square" in names
+        assert "Bhaktapur Durbar Square" in names
+        for c in data["candidates"]:
+            assert c["source"] == "curated"
 
     async def test_admin_unit_offline_lookup(self, client):
         resp = await client.get("/resolve?q=Gorkha")

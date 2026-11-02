@@ -154,26 +154,26 @@ FAMOUS_DESTINATIONS = [
     {
         "short_name": "Kathmandu Durbar Square",
         "type": "heritage_site",
-        "lat": 27.7042,
-        "lon": 85.3077,
+        "lat": 27.7041,
+        "lon": 85.3075,
         "district": "Kathmandu",
-        "aliases": ["kathmandu durbar square", "basantapur", "basantapur durbar square", "hanuman dhoka"],
+        "aliases": ["durbar square", "darbar square", "kathmandu durbar square", "basantapur", "basantapur durbar square", "hanuman dhoka"],
     },
     {
         "short_name": "Patan Durbar Square",
         "type": "heritage_site",
-        "lat": 27.6766,
-        "lon": 85.3255,
+        "lat": 27.6734,
+        "lon": 85.3250,
         "district": "Lalitpur",
-        "aliases": ["patan durbar square", "lalitpur durbar square", "mangalbazar patan", "mangal bazar"],
+        "aliases": ["durbar square", "darbar square", "patan durbar square", "lalitpur durbar square", "mangalbazar patan", "mangal bazar"],
     },
     {
         "short_name": "Bhaktapur Durbar Square",
         "type": "heritage_site",
         "lat": 27.6722,
-        "lon": 85.4298,
+        "lon": 85.4279,
         "district": "Bhaktapur",
-        "aliases": ["bhaktapur durbar square", "bhadgaon", "bhaktapur square"],
+        "aliases": ["durbar square", "darbar square", "bhaktapur durbar square", "bhadgaon", "bhaktapur square"],
     },
     {
         "short_name": "Changunarayan Temple",
@@ -461,18 +461,23 @@ FAMOUS_DESTINATIONS = [
 ]
 
 
+def match_destinations(query: str) -> list[dict]:
+    """
+    Look up a query against the curated destinations table.
+    Returns all matching destination dicts (empty list if none match).
+    """
+    clean_q = query.strip().lower()
+    matches: list[dict] = []
+    for dest in FAMOUS_DESTINATIONS:
+        if clean_q == dest["short_name"].lower() or any(clean_q == a for a in dest["aliases"]):
+            matches.append(dest)
+    return matches
+
+
 def match_destination(query: str) -> dict | None:
     """
     Look up a query against the curated destinations table.
-    Returns destination dict if matched, None otherwise.
+    Returns first matching destination dict if matched, None otherwise.
     """
-    clean_q = query.strip().lower()
-    for dest in FAMOUS_DESTINATIONS:
-        # Check canonical short name
-        if clean_q == dest["short_name"].lower():
-            return dest
-        # Check aliases
-        for alias in dest["aliases"]:
-            if clean_q == alias:
-                return dest
-    return None
+    matches = match_destinations(query)
+    return matches[0] if matches else None
