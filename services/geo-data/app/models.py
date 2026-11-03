@@ -128,6 +128,7 @@ class AreaCentroid(BaseModel):
 class AreaInfo(BaseModel):
     area_km2: float = Field(..., description="Geodesic surface area in square kilometres")
     centroid: AreaCentroid = Field(..., description="Centroid of the requested area")
+    outside_nepal_fraction: float = Field(0.0, ge=0.0, le=1.0, description="Fraction of area outside Nepal (0.0 to 1.0)")
 
 
 class AreaAmenitiesRequest(BaseModel):
@@ -170,3 +171,4 @@ class AreaAmenitiesResponse(BaseModel):
     top_n: int = Field(10, description="Requested top_n limit per category")
     near_lat: Optional[float] = Field(None, description="Proximity sort center latitude, if provided")
     near_lon: Optional[float] = Field(None, description="Proximity sort center longitude, if provided")
+    note: Optional[str] = Field(None, description="Warning if requested area partially extends outside Nepal")

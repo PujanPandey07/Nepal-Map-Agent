@@ -55,6 +55,18 @@ def _get_gdf(layer_name: str):
         return _provinces_gdf
     return None
 
+_nepal_boundary = None
+
+def get_nepal_boundary():
+    global _nepal_boundary
+    if _nepal_boundary is None:
+        provs = _get_gdf('provinces')
+        if hasattr(provs, 'union_all'):
+            _nepal_boundary = provs.union_all()
+        else:
+            import shapely.ops
+            _nepal_boundary = shapely.ops.unary_union(provs.geometry)
+    return _nepal_boundary
 
 def match_admin_unit(query: str) -> Optional[dict]:
     """

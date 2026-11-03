@@ -930,16 +930,16 @@ class TestPhase2AmenitiesArea:
         assert resp.status_code == 422
 
     async def test_amenities_area_empty_result(self, client):
-        # Small polygon in uninhabited coordinates
+        # Small polygon in uninhabited wilderness coordinates inside Nepal (Langtang)
         empty_poly = {
             "type": "Polygon",
             "coordinates": [
                 [
-                    [86.990, 27.990],
-                    [86.991, 27.990],
-                    [86.991, 27.991],
-                    [86.990, 27.991],
-                    [86.990, 27.990],
+                    [85.500, 28.150],
+                    [85.501, 28.150],
+                    [85.501, 28.151],
+                    [85.500, 28.151],
+                    [85.500, 28.150],
                 ]
             ],
         }
@@ -1012,6 +1012,52 @@ class TestPhase1AreaAmenitiesContractFixes:
             ]
         ],
     }
+
+    lucknow_box = {
+        "type": "Polygon",
+        "coordinates": [
+            [
+                [80.9, 26.8],
+                [81.0, 26.8],
+                [81.0, 26.9],
+                [80.9, 26.9],
+                [80.9, 26.8],
+            ]
+        ],
+    }
+
+    biratnagar_straddle_box = {
+        "type": "Polygon",
+        "coordinates": [
+            [
+                [87.25, 26.38],
+                [87.30, 26.38],
+                [87.30, 26.48],
+                [87.25, 26.48],
+                [87.25, 26.38],
+            ]
+        ],
+    }
+
+    async def test_reject_lucknow_box_outside_nepal_real_boundary(self, client):
+        resp = await client.post("/amenities/area", json={"geometry": self.lucknow_box})
+        assert resp.status_code == 422
+        assert "outside nepal" in resp.json()["detail"].lower()
+
+    async def test_chhatradev_outside_fraction_zero(self, client):
+        resp = await client.post("/amenities/area", json={"local_level_code": "55102"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "outside_nepal_fraction" in data["area"]
+        assert data["area"]["outside_nepal_fraction"] == 0.0
+
+    async def test_biratnagar_straddle_outside_fraction_positive(self, client):
+        resp = await client.post("/amenities/area", json={"geometry": self.biratnagar_straddle_box})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["area"]["outside_nepal_fraction"] > 0.0
+        assert data.get("note") is not None
+        assert "outside" in data["note"].lower()
 
     async def test_reject_delhi_box_outside_nepal_bbox(self, client):
         resp = await client.post("/amenities/area", json={"geometry": self.delhi_box})

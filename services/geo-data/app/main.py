@@ -15,7 +15,7 @@ from shapely.validation import make_valid
 from tlf_geo_profiler import profile_dict
 
 from app import config
-from app.admin_matcher import get_polygon_for_local_level
+from app.admin_matcher import get_nepal_boundary, get_polygon_for_local_level
 from app.db_client import DBError, close_pool, fetch_amenities, fetch_amenities_area, get_data_as_of, init_pool
 from app.models import (
     AmenitiesResponse,
@@ -269,29 +269,39 @@ async def post_amenities_area(request: Request, body: AreaAmenitiesRequest):
     except Exception:
         raise HTTPException(status_code=422, detail="Invalid polygon geometry")
 
-    # Reject geometry outside Nepal's bounding box
-    nepal_min_lon = 80.0
-    nepal_max_lon = 88.3
-    nepal_min_lat = 26.3
-    nepal_max_lat = 30.5
-    if (
-        minx < nepal_min_lon
-        or maxx > nepal_max_lon
-        or miny < nepal_min_lat
-        or maxy > nepal_max_lat
-    ):
+    # Check intersection with Nepal's real boundary
+    nepal_boundary = get_nepal_boundary()
+    if not s_geom.intersects(nepal_boundary):
         raise HTTPException(
             status_code=422,
-            detail="Geometry is outside Nepal's bounding box",
+            detail="Geometry is outside Nepal",
         )
 
-    # Calculate geodesic area in square kilometres
+    # Calculate geodesic area in square kilometres and outside_nepal_fraction
+    outside_nepal_fraction = 0.0
+    note = None
     try:
         geod = pyproj.Geod(ellps="WGS84")
         area_m2, _ = geod.geometry_area_perimeter(s_geom)
-        area_km2 = round(abs(area_m2) / 1_000_000.0, 2)
+        tot_area_m2 = abs(area_m2)
+        area_km2 = round(tot_area_m2 / 1_000_000.0, 2)
+
+        if not s_geom.within(nepal_boundary):
+            inter = s_geom.intersection(nepal_boundary)
+            if not inter.is_empty:
+                inter_area_m2, _ = geod.geometry_area_perimeter(inter)
+                inter_m2 = abs(inter_area_m2)
+                if tot_area_m2 > 0:
+                    raw_frac = 1.0 - (inter_m2 / tot_area_m2)
+                    outside_nepal_fraction = round(max(0.0, min(1.0, raw_frac)), 3)
+                    if outside_nepal_fraction > 0.0:
+                        note = "Part of the requested area lies outside Nepal coverage boundaries."
+            else:
+                outside_nepal_fraction = 1.0
+                note = "Part of the requested area lies outside Nepal coverage boundaries."
     except Exception:
         area_km2 = 0.0
+        outside_nepal_fraction = 0.0
 
     if area_km2 > 5000.0:
         raise HTTPException(
@@ -359,6 +369,7 @@ async def post_amenities_area(request: Request, body: AreaAmenitiesRequest):
         "area": {
             "area_km2": area_km2,
             "centroid": centroid,
+            "outside_nepal_fraction": outside_nepal_fraction,
         },
         "summary": summary,
         "categories": categories,
@@ -367,4 +378,5 @@ async def post_amenities_area(request: Request, body: AreaAmenitiesRequest):
         "top_n": body.top_n,
         "near_lat": body.near_lat,
         "near_lon": body.near_lon,
+        "note": note,
     }
