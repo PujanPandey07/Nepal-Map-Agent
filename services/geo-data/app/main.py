@@ -9,7 +9,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from shapely.geometry import shape
+import pyproj
+from shapely.geometry import mapping, shape
+from shapely.validation import make_valid
 from tlf_geo_profiler import profile_dict
 
 from app import config
@@ -236,8 +238,8 @@ async def post_amenities_area(request: Request, body: AreaAmenitiesRequest):
     All disaster-relevant amenities within a polygon or local level boundary.
 
     Accepts either an explicit GeoJSON Polygon/MultiPolygon or a local_level_code.
-    Returns category summary, feature type breakdown, and amenities list.
-    Supports top_n limiting and proximity sorting via near_lat / near_lon.
+    Returns category summary, feature type breakdown, area info, and amenities.
+    Supports top_n limiting per category and proximity sorting via near_lat / near_lon.
     """
     validate_query_params(request, set())
 
@@ -246,23 +248,59 @@ async def post_amenities_area(request: Request, body: AreaAmenitiesRequest):
     if body.local_level_code:
         try:
             geom_dict = get_polygon_for_local_level(body.local_level_code)
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc))
+        except ValueError:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Local level code '{body.local_level_code}' not found",
+            )
 
-    # Validate geometry
+    # Validate and repair geometry
     try:
         s_geom = shape(geom_dict)
         if not s_geom.is_valid:
-            s_geom = s_geom.buffer(0)
+            s_geom = make_valid(s_geom)
             if not s_geom.is_valid:
-                raise ValueError("Invalid polygon geometry")
+                raise ValueError()
         minx, miny, maxx, maxy = s_geom.bounds
         if minx < -180 or maxx > 180 or miny < -90 or maxy > 90:
-            raise ValueError("Coordinates must be within EPSG:4326")
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Invalid geometry: {exc}")
+            raise HTTPException(status_code=422, detail="Coordinates must be within EPSG:4326")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid polygon geometry")
 
-    geojson_str = json.dumps(geom_dict)
+    # Reject geometry outside Nepal's bounding box
+    nepal_min_lon = 80.0
+    nepal_max_lon = 88.3
+    nepal_min_lat = 26.3
+    nepal_max_lat = 30.5
+    if (
+        minx < nepal_min_lon
+        or maxx > nepal_max_lon
+        or miny < nepal_min_lat
+        or maxy > nepal_max_lat
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Geometry is outside Nepal's bounding box",
+        )
+
+    # Calculate geodesic area in square kilometres
+    try:
+        geod = pyproj.Geod(ellps="WGS84")
+        area_m2, _ = geod.geometry_area_perimeter(s_geom)
+        area_km2 = round(abs(area_m2) / 1_000_000.0, 2)
+    except Exception:
+        area_km2 = 0.0
+
+    if area_km2 > 5000.0:
+        raise HTTPException(
+            status_code=422,
+            detail="Geometry area exceeds maximum limit of 5,000 km2",
+        )
+
+    # Send repaired geometry to the database
+    geojson_str = json.dumps(mapping(s_geom))
 
     try:
         amenities = await fetch_amenities_area(geojson_str, timeout_seconds=10.0)
@@ -290,24 +328,41 @@ async def post_amenities_area(request: Request, body: AreaAmenitiesRequest):
         "by_type": by_type,
     }
 
-    # Proximity sorting and top_n truncation
-    items = list(amenities)
-    if body.top_n is not None:
-        if body.near_lat is not None and body.near_lon is not None:
-            items.sort(
-                key=lambda a: _haversine_distance_m(
-                    body.near_lat, body.near_lon, a["lat"], a["lon"]
-                )
-            )
-        items = items[: body.top_n]
+    # Centroid and reference coordinate for distance sorting
+    centroid = {
+        "lat": round(s_geom.centroid.y, 6),
+        "lon": round(s_geom.centroid.x, 6),
+    }
+    ref_lat = body.near_lat if body.near_lat is not None else centroid["lat"]
+    ref_lon = body.near_lon if body.near_lon is not None else centroid["lon"]
 
+    # Top_n per category and truncated flag per category
+    categories: dict[str, list] = {cat: [] for cat in CATEGORY_ORDER}
+    truncated: dict[str, bool] = {cat: False for cat in CATEGORY_ORDER}
+
+    for cat in CATEGORY_ORDER:
+        cat_items = [a for a in amenities if a.get("category", "other") == cat]
+        cat_items.sort(
+            key=lambda a: _haversine_distance_m(ref_lat, ref_lon, a["lat"], a["lon"])
+        )
+        if len(cat_items) > body.top_n:
+            truncated[cat] = True
+        categories[cat] = cat_items[: body.top_n]
+
+    items = [item for cat in CATEGORY_ORDER for item in categories[cat]]
     data_as_of = await get_data_as_of()
 
     return {
         "source": "postgis",
         "data_as_of": data_as_of,
         "data_warning": DATA_WARNING,
+        "area": {
+            "area_km2": area_km2,
+            "centroid": centroid,
+        },
         "summary": summary,
+        "categories": categories,
+        "truncated": truncated,
         "items": items,
         "top_n": body.top_n,
         "near_lat": body.near_lat,

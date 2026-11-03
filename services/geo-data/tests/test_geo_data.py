@@ -959,7 +959,8 @@ class TestPhase2AmenitiesArea:
         resp = await client.post("/amenities/area", json=payload)
         assert resp.status_code == 200
         data = resp.json()
-        assert len(data["items"]) <= 3
+        for cat, cat_items in data["categories"].items():
+            assert len(cat_items) <= 3
         # Summary total should reflect the overall area, not just top_n
         assert data["summary"]["total"] >= len(data["items"])
 
@@ -967,4 +968,105 @@ class TestPhase2AmenitiesArea:
         with patch("app.main.fetch_amenities_area", side_effect=TimeoutError("Statement timed out")):
             resp = await client.post("/amenities/area", json={"geometry": self.sample_poly})
             assert resp.status_code in (504, 502)
+
+
+class TestPhase1AreaAmenitiesContractFixes:
+    """Tests for Phase 1 /amenities/area contract fixes."""
+
+    delhi_box = {
+        "type": "Polygon",
+        "coordinates": [
+            [
+                [77.10, 28.50],
+                [77.30, 28.50],
+                [77.30, 28.70],
+                [77.10, 28.70],
+                [77.10, 28.50],
+            ]
+        ],
+    }
+
+    # ~1 deg x 1 deg box in central Nepal (~10,900 km2)
+    large_box_10900km2 = {
+        "type": "Polygon",
+        "coordinates": [
+            [
+                [83.0, 28.0],
+                [84.0, 28.0],
+                [84.0, 29.0],
+                [83.0, 29.0],
+                [83.0, 28.0],
+            ]
+        ],
+    }
+
+    sample_ktm_box = {
+        "type": "Polygon",
+        "coordinates": [
+            [
+                [85.300, 27.700],
+                [85.320, 27.700],
+                [85.320, 27.720],
+                [85.300, 27.720],
+                [85.300, 27.700],
+            ]
+        ],
+    }
+
+    async def test_reject_delhi_box_outside_nepal_bbox(self, client):
+        resp = await client.post("/amenities/area", json={"geometry": self.delhi_box})
+        assert resp.status_code == 422
+        assert "outside" in resp.json()["detail"].lower()
+
+    async def test_reject_box_over_5000_km2(self, client):
+        resp = await client.post("/amenities/area", json={"geometry": self.large_box_10900km2})
+        assert resp.status_code == 422
+        detail = resp.json()["detail"].lower()
+        assert "5,000" in detail or "5000" in detail or "exceeds" in detail
+
+    async def test_reject_top_n_over_50(self, client):
+        resp = await client.post(
+            "/amenities/area",
+            json={"geometry": self.sample_ktm_box, "top_n": 51},
+        )
+        assert resp.status_code == 422
+
+    async def test_area_block_and_top_n_per_category(self, client):
+        resp = await client.post(
+            "/amenities/area",
+            json={"geometry": self.sample_ktm_box, "top_n": 3},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "area" in data
+        assert "area_km2" in data["area"]
+        assert data["area"]["area_km2"] > 0
+        assert "centroid" in data["area"]
+        assert "lat" in data["area"]["centroid"]
+        assert "lon" in data["area"]["centroid"]
+
+        assert "categories" in data
+        assert "truncated" in data
+        for cat, items in data["categories"].items():
+            assert len(items) <= 3
+            assert cat in data["truncated"]
+            assert isinstance(data["truncated"][cat], bool)
+
+    async def test_self_intersecting_geometry_is_repaired(self, client):
+        # Bowtie polygon (self-intersecting)
+        bowtie = {
+            "type": "Polygon",
+            "coordinates": [
+                [
+                    [85.30, 27.70],
+                    [85.31, 27.71],
+                    [85.31, 27.70],
+                    [85.30, 27.71],
+                    [85.30, 27.70],
+                ]
+            ],
+        }
+        resp = await client.post("/amenities/area", json={"geometry": bowtie})
+        assert resp.status_code == 200
+
 

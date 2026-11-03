@@ -120,10 +120,20 @@ class AmenitiesResponse(BaseModel):
 
 # ── Area Amenities ────────────────────────────────────────────────────────────
 
+class AreaCentroid(BaseModel):
+    lat: float = Field(..., description="Latitude of polygon centroid")
+    lon: float = Field(..., description="Longitude of polygon centroid")
+
+
+class AreaInfo(BaseModel):
+    area_km2: float = Field(..., description="Geodesic surface area in square kilometres")
+    centroid: AreaCentroid = Field(..., description="Centroid of the requested area")
+
+
 class AreaAmenitiesRequest(BaseModel):
     geometry: Optional[dict[str, Any]] = Field(None, description="GeoJSON Polygon or MultiPolygon in EPSG:4326")
     local_level_code: Optional[str] = Field(None, description="Official local level code (e.g. '55102')")
-    top_n: Optional[int] = Field(None, ge=1, le=1000, description="Optional cap on returned amenities")
+    top_n: int = Field(10, ge=1, le=50, description="Max amenities returned per category (default 10, max 50)")
     near_lat: Optional[float] = Field(None, ge=-90, le=90, description="Latitude to sort results by proximity")
     near_lon: Optional[float] = Field(None, ge=-180, le=180, description="Longitude to sort results by proximity")
 
@@ -152,8 +162,11 @@ class AreaAmenitiesResponse(BaseModel):
     source: str = Field("postgis", description="Data source")
     data_as_of: str = Field(..., description="Date of the imported OSM snapshot")
     data_warning: str = Field(..., description="Grounding warning regarding rural OSM completeness")
+    area: AreaInfo = Field(..., description="Geodesic area metadata and centroid")
     summary: AreaSummary = Field(..., description="Summary statistics of amenities in the area")
+    categories: dict[str, list[AmenityItem]] = Field(..., description="Amenities grouped by category, up to top_n per category")
+    truncated: dict[str, bool] = Field(..., description="Whether each category was truncated by top_n")
     items: list[AmenityItem] = Field(..., description="List of amenities matching the area")
-    top_n: Optional[int] = Field(None, description="Requested top_n limit, if any")
+    top_n: int = Field(10, description="Requested top_n limit per category")
     near_lat: Optional[float] = Field(None, description="Proximity sort center latitude, if provided")
     near_lon: Optional[float] = Field(None, description="Proximity sort center longitude, if provided")
