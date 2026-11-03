@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import pyproj
 from shapely.geometry import mapping, shape
 from shapely.validation import make_valid
@@ -16,7 +17,15 @@ from tlf_geo_profiler import profile_dict
 
 from app import config
 from app.admin_matcher import get_nepal_boundary, get_polygon_for_local_level
-from app.db_client import DBError, close_pool, fetch_amenities, fetch_amenities_area, get_data_as_of, init_pool
+from app.db_client import (
+    DBError,
+    check_db_health,
+    close_pool,
+    fetch_amenities,
+    fetch_amenities_area,
+    get_data_as_of,
+    init_pool,
+)
 from app.models import (
     AmenitiesResponse,
     AreaAmenitiesRequest,
@@ -101,8 +110,22 @@ async def _call_profile_dict(lat: float, lon: float) -> dict:
 @app.get("/health", response_model=HealthResponse)
 async def health(request: Request):
     validate_query_params(request, set())
+    db_ok = await check_db_health(timeout_seconds=2.0)
     data_as_of = await get_data_as_of()
-    return {"status": "ok", "data_as_of": data_as_of}
+    if not db_ok:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "degraded",
+                "database": "down",
+                "data_as_of": data_as_of,
+            },
+        )
+    return {
+        "status": "ok",
+        "database": "up",
+        "data_as_of": data_as_of,
+    }
 
 
 @app.get("/resolve", response_model=ResolveResponse)

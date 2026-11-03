@@ -278,6 +278,19 @@ async def get_pool() -> AsyncConnectionPool:
     return _pool
 
 
+async def check_db_health(timeout_seconds: float = 2.0) -> bool:
+    """Return True if a test query against PostGIS succeeds, False otherwise."""
+    try:
+        pool = await get_pool()
+        async with pool.connection(timeout=timeout_seconds) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT 1;")
+                return True
+    except Exception as exc:
+        logger.warning("Database health check failed: %s", exc)
+        return False
+
+
 async def get_data_as_of() -> str:
     """
     Return data snapshot date from osm2pgsql_properties table if present,

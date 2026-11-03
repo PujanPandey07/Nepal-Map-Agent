@@ -400,6 +400,13 @@ class TestHealthEndpoint:
         assert data["status"] == "ok"
         assert "data_as_of" in data  # date of the imported OSM data
 
+    async def test_health_returns_503_when_db_down(self, client):
+        with patch("app.main.check_db_health", new=AsyncMock(return_value=False)):
+            resp = await client.get("/health")
+            assert resp.status_code == 503
+            data = resp.json()
+            assert data["database"] == "down"
+
 
 class TestProfileEndpoint:
     async def test_valid_coordinate_returns_profile(self, client):

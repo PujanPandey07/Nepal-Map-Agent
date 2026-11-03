@@ -10,8 +10,9 @@ from pydantic import BaseModel, Field, model_validator
 # ── Health ────────────────────────────────────────────────────────────────────
 
 class HealthResponse(BaseModel):
-    status: str = Field("ok", description="Service status")
+    status: str = Field("ok", description="Service status ('ok' or 'degraded')")
     data_as_of: str = Field(..., description="Date of the imported OSM data snapshot (YYYY-MM-DD)")
+    database: Optional[str] = Field("up", description="Database status ('up' or 'down')")
 
 
 # ── Resolve ───────────────────────────────────────────────────────────────────
