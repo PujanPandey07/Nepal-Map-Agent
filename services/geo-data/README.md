@@ -105,7 +105,7 @@ cd services/geo-data
 
 ---
 
-## 7. Monthly Data Refresh (Zero-Downtime Swap)
+## 7. Monthly Data Refresh (Database Swap)
 
 A PowerShell script automates the monthly sync:
 
@@ -121,10 +121,12 @@ Workflow:
 4. Runs sanity checks:
    - Row count matches old database within 15-20%
    - Chhatradev query returns >= 50 amenities
-5. Atomically swaps databases:
+5. Swaps databases (the `nepal-geo-data` container is stopped during the swap, so the API is briefly down):
    - Renames `nepal_osm` -> `nepal_osm_old`
    - Renames `nepal_osm_next` -> `nepal_osm`
 6. Updates `DATA_AS_OF` in `.env`
+
+> **Not safe to register yet:** the trigger in `register_refresh_task.ps1` falls back to a daily run, and `refresh_osm.ps1` has not been tested end to end.
 
 To automate on Windows Task Scheduler, run once as Administrator:
 ```powershell
