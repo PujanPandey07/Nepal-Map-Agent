@@ -11,7 +11,9 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import pyproj
+import shapely
 from shapely.geometry import mapping, shape
+from shapely.ops import unary_union
 from shapely.validation import make_valid
 from tlf_geo_profiler import profile_dict
 
@@ -23,6 +25,7 @@ from app.db_client import (
     close_pool,
     fetch_amenities,
     fetch_amenities_area,
+    get_cached_data_as_of,
     get_data_as_of,
     init_pool,
 )
@@ -48,6 +51,10 @@ DATA_WARNING = (
     "OSM coverage in rural Nepal is incomplete. "
     "Absence of a facility does not mean it does not exist."
 )
+
+# Limits for /amenities/area
+MAX_AREA_KM2 = 5000.0
+MAX_GEOMETRY_VERTICES = 200_000   # guards the DB and CPU against huge payloads
 
 # Category keys in the order we want them in the response
 CATEGORY_ORDER = [
@@ -86,6 +93,24 @@ app.add_middleware(
 )
 
 
+# ── geometry helper ──────────────────────────────────────────────────────────
+
+def _polygonal_only(geom):
+    """
+    make_valid() can return a GeometryCollection (polygons plus stray lines or
+    points).  Keep only the polygonal parts; raise ValueError if there are none.
+    """
+    if geom.geom_type in ("Polygon", "MultiPolygon"):
+        return geom
+    parts = [
+        g for g in getattr(geom, "geoms", [])
+        if g.geom_type in ("Polygon", "MultiPolygon") and not g.is_empty
+    ]
+    if not parts:
+        raise ValueError("geometry has no polygonal part")
+    return unary_union(parts)
+
+
 # ── validation helper ────────────────────────────────────────────────────────
 
 def validate_query_params(request: Request, allowed: set[str]) -> None:
@@ -111,7 +136,9 @@ async def _call_profile_dict(lat: float, lon: float) -> dict:
 async def health(request: Request):
     validate_query_params(request, set())
     db_ok = await check_db_health(timeout_seconds=2.0)
-    data_as_of = await get_data_as_of()
+    # When the DB is down, do not try to read data_as_of from it (that would
+    # wait on the pool and defeat the 2 s health-check timeout).
+    data_as_of = await get_data_as_of() if db_ok else get_cached_data_as_of()
     if not db_ok:
         return JSONResponse(
             status_code=503,
@@ -207,14 +234,19 @@ async def get_amenities(
     Categories returned:
       health            hospitals, clinics, pharmacies, health posts
       emergency_services  police, fire stations, ambulance stations
-      evacuation_sites  schools, community centres, shelters, places of worship
+      emergency_services  police, fire stations, ambulance stations and other
+                        emergency=* equipment (hydrants, defibrillators, ...)
+      evacuation_sites  schools, community centres, shelters, places of worship,
+                        and emergency=assembly_point muster points
       infrastructure    helipads, fuel stations
-      food_and_water    supermarkets, water points
+      food_and_water    supermarkets, convenience shops, drinking-water points
       government        government offices, town halls
       other             anything else matched by the query
 
-    Results are deduplicated (node + way for the same building counted once)
-    and cached for 10 minutes.  *data_warning* must be surfaced to users.
+    Results are deduplicated: a *named* feature mapped as both a node and a way
+    (same name, same category, within 100 m) is counted once and the tags of
+    both are merged.  Unnamed features are never merged.  Results are not
+    cached.  *data_warning* must be surfaced to users.
     """
     validate_query_params(request, {"lat", "lon", "radius_m"})
     try:
@@ -280,10 +312,16 @@ async def post_amenities_area(request: Request, body: AreaAmenitiesRequest):
     # Validate and repair geometry
     try:
         s_geom = shape(geom_dict)
+        if shapely.get_num_coordinates(s_geom) > MAX_GEOMETRY_VERTICES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Geometry has too many vertices (max {MAX_GEOMETRY_VERTICES:,})",
+            )
         if not s_geom.is_valid:
             s_geom = make_valid(s_geom)
             if not s_geom.is_valid:
                 raise ValueError()
+        s_geom = _polygonal_only(s_geom)
         minx, miny, maxx, maxy = s_geom.bounds
         if minx < -180 or maxx > 180 or miny < -90 or maxy > 90:
             raise HTTPException(status_code=422, detail="Coordinates must be within EPSG:4326")
@@ -300,7 +338,9 @@ async def post_amenities_area(request: Request, body: AreaAmenitiesRequest):
             detail="Geometry is outside Nepal",
         )
 
-    # Calculate geodesic area in square kilometres and outside_nepal_fraction
+    # Calculate geodesic area in square kilometres and outside_nepal_fraction.
+    # This MUST fail closed: if the area cannot be computed we cannot enforce
+    # the size limit, so the request is rejected rather than let through.
     outside_nepal_fraction = 0.0
     note = None
     try:
@@ -322,11 +362,14 @@ async def post_amenities_area(request: Request, body: AreaAmenitiesRequest):
             else:
                 outside_nepal_fraction = 1.0
                 note = "Part of the requested area lies outside Nepal coverage boundaries."
-    except Exception:
-        area_km2 = 0.0
-        outside_nepal_fraction = 0.0
+    except Exception as exc:
+        logger.error("Could not compute geometry area: %s", exc)
+        raise HTTPException(
+            status_code=422,
+            detail="Could not compute the area of the supplied geometry",
+        )
 
-    if area_km2 > 5000.0:
+    if area_km2 > MAX_AREA_KM2:
         raise HTTPException(
             status_code=422,
             detail="Geometry area exceeds maximum limit of 5,000 km2",

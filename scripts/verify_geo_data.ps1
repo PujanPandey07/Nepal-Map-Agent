@@ -3,7 +3,7 @@
 # Tests all core endpoints and contracts against a running service instance.
 
 param(
-    [string]$BaseUrl = "http://127.0.0.1:8000"
+    [string]$BaseUrl = "http://127.0.0.1:8001"
 )
 
 Write-Host "==========================================================" -ForegroundColor Cyan

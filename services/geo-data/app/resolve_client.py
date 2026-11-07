@@ -9,7 +9,9 @@ Tier 2: Administrative matching via tlf-geo + boundary centroids (instant, offli
         - Covers all 7 Provinces, 77 Districts, 753 Local Levels
         - 100% offline, zero latency, no rate limits
 Tier 3: Live Nominatim (OSM geocoder) with category reranking
-        - Reranks results so natural/place/boundaries beat amenities/shops/restaurants.
+        - Among results of similar importance, prefers natural/place/boundary
+          entities over shops/restaurants (health and emergency amenities are
+          lifted to the same level as tourism, since this is a disaster tool).
 """
 import asyncio
 import logging
@@ -21,7 +23,7 @@ import httpx
 import pandas as pd
 from tlf_geo_profiler import profile_dict
 
-from app.admin_matcher import match_admin_unit
+from app.admin_matcher import match_admin_units
 from app.curated_destinations import match_destination, match_destinations
 
 logger = logging.getLogger("geo-data.resolve")
@@ -33,7 +35,9 @@ HEADERS = {
 
 NOMINATIM_TIMEOUT = 5.0        # Hard timeout in seconds
 NOMINATIM_CACHE_TTL = 600.0    # 10 minutes cache TTL
+NOMINATIM_CACHE_MAX = 512      # bound memory: user-supplied queries are the keys
 _AMBIGUITY_GAP = 0.15
+_IMPORTANCE_BIN = 0.05         # importance values closer than this count as "similar"
 
 # In-memory TTL cache: normalized_query -> (monotonic_timestamp, results)
 _nominatim_cache: dict[str, tuple[float, list[dict]]] = {}
@@ -70,6 +74,13 @@ CLASS_PRIORITY = {
     "landuse": 4,
     "amenity": 2,
     "shop": 1,
+}
+
+# amenity types that matter for disaster response: ranked like tourism rather
+# than like a generic shop or restaurant.
+DISASTER_AMENITY_TYPES = {
+    "hospital", "clinic", "police", "fire_station", "ambulance_station",
+    "shelter", "community_centre", "school", "college", "university",
 }
 
 
@@ -127,9 +138,17 @@ async def resolve_place(q: str, limit: int = 5) -> list[dict]:
         logger.error("Could not reach Nominatim: %r", e)
         raise ResolveError("Could not reach Nominatim") from e
 
-    # 4. Cache update
+    # 4. Cache update (bounded: purge expired, then evict oldest if still full)
     async with _cache_lock:
-        _nominatim_cache[cache_key] = (time.monotonic(), data)
+        now = time.monotonic()
+        if len(_nominatim_cache) >= NOMINATIM_CACHE_MAX:
+            for k in [k for k, (ts, _) in _nominatim_cache.items()
+                      if now - ts >= NOMINATIM_CACHE_TTL]:
+                del _nominatim_cache[k]
+            while len(_nominatim_cache) >= NOMINATIM_CACHE_MAX:
+                oldest = min(_nominatim_cache, key=lambda k: _nominatim_cache[k][0])
+                del _nominatim_cache[oldest]
+        _nominatim_cache[cache_key] = (now, data)
 
     return data
 
@@ -207,6 +226,11 @@ def enrich_candidate(cand: dict) -> dict:
     return cand
 
 
+def _enrich_all(cands: list[dict]) -> list[dict]:
+    """Enrich several candidates (CPU-bound; call via asyncio.to_thread)."""
+    return [enrich_candidate(c) for c in cands]
+
+
 def make_candidate_label(cand: dict) -> str:
     """
     Construct a human-readable disambiguation label,
@@ -244,6 +268,13 @@ def parse_candidates(raw: list[dict]) -> list[dict]:
     """
     candidates = []
     for r in raw:
+        try:
+            f_lat = float(r["lat"])
+            f_lon = float(r["lon"])
+            f_importance = float(r.get("importance", 0.0))
+        except (KeyError, TypeError, ValueError):
+            logger.warning("Skipping malformed Nominatim result: %.200r", r)
+            continue
         addr = r.get("address", {}) or {}
         name_details = r.get("namedetails", {}) or {}
         short_name = (
@@ -257,9 +288,9 @@ def parse_candidates(raw: list[dict]) -> list[dict]:
             "short_name": short_name,
             "type": _clean_str(r.get("type")) or "",
             "osm_class": _clean_str(r.get("class")) or "",
-            "lat": float(r["lat"]),
-            "lon": float(r["lon"]),
-            "importance": float(r.get("importance", 0.0)),
+            "lat": f_lat,
+            "lon": f_lon,
+            "importance": f_importance,
             "source": "nominatim",
             "address": {
                 k: _clean_str(v)
@@ -269,10 +300,17 @@ def parse_candidates(raw: list[dict]) -> list[dict]:
             },
         })
 
-    # Secondary sort: class priority then importance score
+    # Rank: bucket importance into coarse bins, then class priority inside a
+    # bin, then exact importance.  (The old key was (importance, priority), so
+    # priority only mattered for exactly equal floats and reranking never
+    # happened.)  Results whose importance differs by more than one bin keep
+    # their Nominatim order.
     def _rank_key(c):
-        priority = CLASS_PRIORITY.get(c.get("osm_class", ""), 3)
-        return (c["importance"], priority)
+        osm_class = c.get("osm_class", "")
+        priority = CLASS_PRIORITY.get(osm_class, 3)
+        if osm_class == "amenity" and c.get("type") in DISASTER_AMENITY_TYPES:
+            priority = max(priority, CLASS_PRIORITY["tourism"])
+        return (math.floor(c["importance"] / _IMPORTANCE_BIN), priority, c["importance"])
 
     candidates.sort(key=_rank_key, reverse=True)
     return candidates
@@ -307,8 +345,8 @@ async def resolve_query(q: str) -> dict:
     # ── Tier 1: Curated Famous Destinations ──────────────────────────────────
     dests = match_destinations(clean_q)
     if dests:
-        candidates = [
-            enrich_candidate({
+        raw_candidates = [
+            ({
                 "name": f"{dest['short_name']}, {dest.get('district', '')}, Nepal".strip(", "),
                 "short_name": dest["short_name"],
                 "type": dest["type"],
@@ -324,6 +362,7 @@ async def resolve_query(q: str) -> dict:
             })
             for dest in dests
         ]
+        candidates = await asyncio.to_thread(_enrich_all, raw_candidates)
         is_ambiguous = len(candidates) > 1
         options = (
             [
@@ -348,21 +387,38 @@ async def resolve_query(q: str) -> dict:
         }
 
     # ── Tier 2: Administrative Geography (tlf-geo + boundaries) ──────────────
-    admin = match_admin_unit(clean_q)
-    if admin:
-        enriched_admin = enrich_candidate(admin)
+    # (pandas + polygon work: keep it off the event loop)
+    admins = await asyncio.to_thread(match_admin_units, clean_q)
+    if admins:
+        candidates = await asyncio.to_thread(_enrich_all, admins)
+        # Same name at several levels (e.g. a district and a municipality):
+        # ask the user instead of silently picking one.
+        is_ambiguous = len(candidates) > 1
+        options = (
+            [
+                {
+                    "id": str(idx + 1),
+                    "label": f"{c.get('short_name')} ({c.get('type')})",
+                    "lat": c["lat"],
+                    "lon": c["lon"],
+                }
+                for idx, c in enumerate(candidates)
+            ]
+            if is_ambiguous
+            else []
+        )
         return {
             "query": q,
-            "ambiguous": False,
-            "best_match": enriched_admin,
-            "candidates": [enriched_admin],
-            "clarification_needed": False,
-            "options": [],
+            "ambiguous": is_ambiguous,
+            "best_match": None if is_ambiguous else candidates[0],
+            "candidates": candidates,
+            "clarification_needed": is_ambiguous,
+            "options": options,
         }
 
     # ── Tier 3: Nominatim Live Geocoding ─────────────────────────────────────
     raw = await resolve_place(clean_q)
-    candidates = [enrich_candidate(c) for c in parse_candidates(raw)]
+    candidates = await asyncio.to_thread(_enrich_all, parse_candidates(raw))
     best, ambiguous = pick_best(candidates)
 
     options = (

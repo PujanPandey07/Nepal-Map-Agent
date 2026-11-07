@@ -29,8 +29,9 @@ async def cleanup_db_pool():
 async def client():
     """
     Async HTTP client wired directly to the FastAPI app (no real server needed).
-    The lifespan runs, which warms up tlf-geo-profiler — that's fine since it
-    only loads bundled files and makes no network calls.
+    Note: httpx's ASGITransport does NOT run the app's lifespan, so the
+    startup warm-up and eager DB-pool creation are skipped here; the pool is
+    created lazily on first use (see db_client.get_pool).
     """
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"

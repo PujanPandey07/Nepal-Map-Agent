@@ -5,7 +5,7 @@ PostGIS database client for the geo-data service.
 Replaces the live Overpass API with a local PostGIS database backed by
 a downloaded Nepal OSM .pbf file (osm2pgsql --hstore import).
 
-Public API (identical contract to osm_client.py):
+Public API:
     fetch_amenities(lat, lon, radius_m) -> list[dict]
     DBError                             (exception)
 
@@ -15,12 +15,16 @@ through amenity_utils.to_amenity_dict():
 
 This means amenity_utils.classify_element and deduplicate work unchanged.
 """
+import asyncio
 import logging
+import math
 import re
+import time
 from typing import Any
 
 import psycopg
 import psycopg.errors
+import psycopg.rows
 from psycopg.types import TypeInfo
 from psycopg.types.hstore import register_hstore
 from psycopg_pool import AsyncConnectionPool
@@ -33,16 +37,21 @@ logger = logging.getLogger("geo-data.db")
 _HSTORE_RE = re.compile(r'"((?:[^"\\]|\\.)*)"\s*=>\s*(?:NULL|"((?:[^"\\]|\\.)*)")')
 
 
+# Single-pass unescape: backslash + any char -> that char.  (Chained .replace()
+# calls mis-handle sequences such as  \\"  .)
+_HSTORE_UNESCAPE_RE = re.compile(r"\\(.)")
+
+
 def _parse_hstore(text: str) -> dict[str, str]:
     """Parse raw hstore string representation as fallback."""
     if not text:
         return {}
     res: dict[str, str] = {}
     for m in _HSTORE_RE.finditer(text):
-        k = m.group(1).replace(r'\"', '"').replace(r'\\', '\\')
+        k = _HSTORE_UNESCAPE_RE.sub(r"\1", m.group(1))
         v = m.group(2)
         if v is not None:
-            res[k] = v.replace(r'\"', '"').replace(r'\\', '\\')
+            res[k] = _HSTORE_UNESCAPE_RE.sub(r"\1", v)
     return res
 
 
@@ -63,8 +72,8 @@ class DBError(Exception):
 #   osm_id                          — standard column
 #   way                             — geometry already in EPSG:4326
 #
-# Filter: at least one relevant tag must be non-null.  Matching mirrors
-# the Overpass query categories in osm_client.build_amenities_query().
+# Filter: at least one relevant tag must be non-null.  Keep this in sync with
+# the category sets in amenity_utils.py.
 
 _AMENITY_FILTER = """
     amenity IN (
@@ -73,7 +82,7 @@ _AMENITY_FILTER = """
         'police','fire_station','ambulance_station',
         'school','college','university','community_centre',
         'social_facility','shelter','place_of_worship',
-        'fuel','water_point','townhall'
+        'fuel','water_point','drinking_water','townhall'
     )
     OR (tags->'healthcare') IS NOT NULL
     OR (tags->'emergency')  IS NOT NULL
@@ -83,6 +92,9 @@ _AMENITY_FILTER = """
 """
 
 # Points: way is geometry(Point,4326) — no transform needed.
+# The `way && envelope` prefilter is what lets PostGIS use the GiST index;
+# casting `way::geography` alone defeats it and forces a full table scan.
+# Params: (xmin, ymin, xmax, ymax, lon, lat, radius_m)
 _POINTS_SQL = f"""
 SELECT
     osm_id,
@@ -98,7 +110,8 @@ SELECT
     tags               AS extra_tags
 FROM planet_osm_point
 WHERE
-    ST_DWithin(
+    way && ST_MakeEnvelope(%s, %s, %s, %s, 4326)
+    AND ST_DWithin(
         way::geography,
         ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
         %s
@@ -108,7 +121,10 @@ WHERE
 
 # Polygons: use ST_PointOnSurface to get a representative interior point.
 # Bounding-box pre-filter (&&) makes use of the GiST index before the
-# exact geography check.
+# exact geography check.  The envelope is computed in Python (_bbox) because
+# a degree of longitude is shorter than a degree of latitude away from the
+# equator.
+# Params: (xmin, ymin, xmax, ymax, lon, lat, radius_m)
 _POLYGONS_SQL = f"""
 SELECT
     osm_id,
@@ -124,10 +140,7 @@ SELECT
     tags               AS extra_tags
 FROM planet_osm_polygon
 WHERE
-    way && ST_Expand(
-        ST_SetSRID(ST_MakePoint(%s, %s), 4326),
-        %s / 111320.0          -- rough degree-equivalent of radius_m
-    )
+    way && ST_MakeEnvelope(%s, %s, %s, %s, 4326)
     AND ST_DWithin(
         ST_PointOnSurface(way)::geography,
         ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
@@ -233,10 +246,41 @@ def _row_to_element(row: dict[str, Any], element_type: str) -> dict:
     }
 
 
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+_METRES_PER_DEG_LAT = 111_320.0
+
+
+def _bbox(lat: float, lon: float, radius_m: float) -> tuple[float, float, float, float]:
+    """
+    Return (xmin, ymin, xmax, ymax) in degrees that fully contains a circle of
+    radius_m around (lat, lon).  Longitude is widened by 1/cos(lat) so the box
+    is not too narrow east-west; a 2% margin absorbs geodesic-vs-planar error.
+    """
+    margin = 1.02
+    dlat = radius_m / _METRES_PER_DEG_LAT * margin
+    cos_lat = max(math.cos(math.radians(lat)), 0.01)   # guard near the poles
+    dlon = radius_m / (_METRES_PER_DEG_LAT * cos_lat) * margin
+    return (lon - dlon, lat - dlat, lon + dlon, lat + dlat)
+
+
+def _postprocess(point_rows: list, poly_rows: list) -> list[dict]:
+    """Row conversion + dedup + classification.  CPU-bound: run in a thread."""
+    elements: list[dict] = []
+    for row in point_rows:
+        elements.append(_row_to_element(row, "node"))
+    for row in poly_rows:
+        elements.append(_row_to_element(row, "way"))
+    deduped = deduplicate(elements)
+    return [a for el in deduped if (a := to_amenity_dict(el)) is not None]
+
+
 # ── connection pool ──────────────────────────────────────────────────────────
 
 _pool: AsyncConnectionPool | None = None
 _data_as_of: str | None = None
+_data_as_of_ts: float = 0.0
+_DATA_AS_OF_TTL_SECONDS = 3600.0
 
 
 async def _configure_connection(conn: psycopg.AsyncConnection) -> None:
@@ -291,30 +335,48 @@ async def check_db_health(timeout_seconds: float = 2.0) -> bool:
         return False
 
 
+def get_cached_data_as_of() -> str:
+    """Last known snapshot date without touching the DB (safe when DB is down)."""
+    return _data_as_of or config.DATA_AS_OF
+
+
 async def get_data_as_of() -> str:
     """
     Return data snapshot date from osm2pgsql_properties table if present,
-    otherwise fallback to config.DATA_AS_OF.
+    otherwise fall back to config.DATA_AS_OF.
+
+    The value is cached for an hour (so a monthly refresh is picked up without
+    a restart).  A transient DB failure is NOT cached as the fallback value.
     """
-    global _data_as_of
-    if _data_as_of is not None:
+    global _data_as_of, _data_as_of_ts
+    if _data_as_of is not None and (time.monotonic() - _data_as_of_ts) < _DATA_AS_OF_TTL_SECONDS:
         return _data_as_of
     try:
         pool = await get_pool()
-        async with pool.connection() as conn:
+        async with pool.connection(timeout=3.0) as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT value FROM osm2pgsql_properties WHERE property = 'replication_timestamp' OR property = 'import_timestamp' ORDER BY property DESC LIMIT 1;"
+                    "SELECT value FROM osm2pgsql_properties "
+                    "WHERE property IN ('replication_timestamp', 'import_timestamp') "
+                    "ORDER BY property DESC LIMIT 1;"
                 )
                 row = await cur.fetchone()
-                if row and row[0]:
-                    val = str(row[0]).strip()
-                    date_part = val.split("T")[0]
-                    _data_as_of = date_part
+                if row and row["value"]:
+                    _data_as_of = str(row["value"]).strip().split("T")[0]
+                    _data_as_of_ts = time.monotonic()
                     return _data_as_of
+    except psycopg.errors.UndefinedTable:
+        # Table genuinely absent (legacy import) -> the fallback is the answer.
+        logger.debug("osm2pgsql_properties not present; using configured DATA_AS_OF")
+        _data_as_of = config.DATA_AS_OF
+        _data_as_of_ts = time.monotonic()
+        return _data_as_of
     except Exception as e:
+        # Transient failure: answer with the best known value but retry next time.
         logger.debug("Could not read osm2pgsql_properties: %s", e)
+        return get_cached_data_as_of()
     _data_as_of = config.DATA_AS_OF
+    _data_as_of_ts = time.monotonic()
     return _data_as_of
 
 
@@ -328,44 +390,40 @@ async def fetch_amenities(lat: float, lon: float, radius_m: int) -> list[dict]:
     Raises DBError if the database query fails.
     """
     try:
+        xmin, ymin, xmax, ymax = _bbox(lat, lon, radius_m)
         pool = await get_pool()
         async with pool.connection() as conn:
             # Points
             async with conn.cursor() as cur:
-                await cur.execute(_POINTS_SQL, (lon, lat, radius_m))
+                await cur.execute(
+                    _POINTS_SQL,
+                    (xmin, ymin, xmax, ymax, lon, lat, radius_m),
+                )
                 point_rows = await cur.fetchall()
 
             # Polygons
             async with conn.cursor() as cur:
                 await cur.execute(
                     _POLYGONS_SQL,
-                    (lon, lat, radius_m, lon, lat, radius_m),
+                    (xmin, ymin, xmax, ymax, lon, lat, radius_m),
                 )
                 poly_rows = await cur.fetchall()
 
-    except (psycopg.Error, Exception) as exc:
+    except Exception as exc:
         logger.error("Database error: %s", exc)
         raise DBError(f"PostGIS query failed: {exc}") from exc
-
-    # Convert to Overpass-compatible elements
-    elements: list[dict] = []
-    for row in point_rows:
-        elements.append(_row_to_element(row, "node"))
-    for row in poly_rows:
-        elements.append(_row_to_element(row, "way"))
 
     logger.info(
         "DB returned %d points + %d polygons before dedup",
         len(point_rows), len(poly_rows),
     )
 
-    # Dedup and classify — identical pipeline as the Overpass path
-    deduped = deduplicate(elements)
-    amenities = [a for el in deduped if (a := to_amenity_dict(el)) is not None]
+    # Dedup + classify off the event loop (pure-Python, can be heavy).
+    amenities = await asyncio.to_thread(_postprocess, point_rows, poly_rows)
 
     logger.info(
-        "After dedup: %d amenities (%d raw elements)",
-        len(amenities), len(elements),
+        "After dedup: %d amenities (%d raw rows)",
+        len(amenities), len(point_rows) + len(poly_rows),
     )
     return amenities
 
@@ -373,14 +431,19 @@ async def fetch_amenities(lat: float, lon: float, radius_m: int) -> list[dict]:
 async def fetch_amenities_area(geojson_geom_str: str, timeout_seconds: float = 10.0) -> list[dict]:
     """
     Fetch, clean and categorise all disaster-relevant amenities intersecting a GeoJSON area.
-    Sets a 10s statement timeout to avoid DB locks from large polygons.
+    Applies a statement timeout (default 10s) to avoid DB locks from large
+    polygons.  The timeout is transaction-scoped (set_config(..., is_local=true))
+    so it can never leak onto the pooled connection's next user.
     """
     timeout_ms = int(timeout_seconds * 1000)
     try:
         pool = await get_pool()
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute(f"SET statement_timeout = {timeout_ms};")
+                await cur.execute(
+                    "SELECT set_config('statement_timeout', %s, true);",
+                    (str(timeout_ms),),
+                )
                 # Points
                 await cur.execute(_POINTS_AREA_SQL, (geojson_geom_str, geojson_geom_str))
                 point_rows = await cur.fetchall()
@@ -399,17 +462,9 @@ async def fetch_amenities_area(geojson_geom_str: str, timeout_seconds: float = 1
         logger.error("Database error in area query: %s", exc)
         raise DBError(f"PostGIS area query failed: {exc}") from exc
 
-    elements: list[dict] = []
-    for row in point_rows:
-        elements.append(_row_to_element(row, "node"))
-    for row in poly_rows:
-        elements.append(_row_to_element(row, "way"))
-
     logger.info(
         "Area DB returned %d points + %d polygons before dedup",
         len(point_rows), len(poly_rows),
     )
 
-    deduped = deduplicate(elements)
-    amenities = [a for el in deduped if (a := to_amenity_dict(el)) is not None]
-    return amenities
+    return await asyncio.to_thread(_postprocess, point_rows, poly_rows)

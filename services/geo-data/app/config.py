@@ -22,8 +22,8 @@ from dotenv import load_dotenv
 # .env (if it exists), giving the service-level file higher priority.
 _parents = Path(__file__).resolve().parents
 if len(_parents) > 3:
-    _project_root = _parents[3]  # nepal-map-agent/
-    _service_root = _parents[2]  # services/geo-data/
+    _project_root = _parents[3]  # nepal-map-agent/   (app -> geo-data -> services -> root)
+    _service_root = _parents[1]  # services/geo-data/
     load_dotenv(_project_root / ".env")            # project root .env (lower priority)
     load_dotenv(_service_root / ".env", override=True)  # service .env (higher priority)
 elif len(_parents) > 1:

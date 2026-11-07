@@ -3,6 +3,12 @@
 #
 # Run this once in PowerShell as Administrator:
 #   powershell -ExecutionPolicy Bypass -File scripts/register_refresh_task.ps1
+#
+# NOTE: New-ScheduledTaskTrigger has no -Monthly option, so the old version of
+# this script silently fell back to a DAILY trigger.  schtasks.exe supports a
+# real monthly schedule, so it is used here and its exit code is checked.
+
+$ErrorActionPreference = "Stop"
 
 $TaskName = "NepalOSM_MonthlyRefresh"
 $ScriptPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "refresh_osm.ps1"
@@ -10,21 +16,22 @@ $ScriptPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "refre
 Write-Host "Registering monthly Task Scheduler job: $TaskName"
 Write-Host "Target script: $ScriptPath"
 
-$Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`""
-$Trigger = New-ScheduledTaskTrigger -Monthly -DaysOfWeek 1 -At "02:00" 2>$null
-if (-not $Trigger) {
-    # Fallback trigger: 30 days interval
-    $Trigger = New-ScheduledTaskTrigger -Daily -At "02:00"
+# /TR value: the whole command line as one string, with the script path quoted.
+$Command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`""
+
+# /SC MONTHLY /D 1 = day 1 of every month; /F overwrites an existing task.
+schtasks.exe /Create /TN $TaskName /TR $Command /SC MONTHLY /D 1 /ST 02:00 /F
+if ($LASTEXITCODE -ne 0) {
+    throw "schtasks /Create failed with exit code $LASTEXITCODE (run this script as Administrator)"
 }
 
-$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+# Run a missed job as soon as possible (e.g. the PC was off at 02:00) and allow
+# it on battery.
+$task = Get-ScheduledTask -TaskName $TaskName
+$task.Settings.StartWhenAvailable = $true
+$task.Settings.DisallowStartIfOnBatteries = $false
+$task.Settings.StopIfGoingOnBatteries = $false
+$task | Set-ScheduledTask | Out-Null
 
-Register-ScheduledTask `
-    -TaskName $TaskName `
-    -Action $Action `
-    -Trigger $Trigger `
-    -Settings $Settings `
-    -Description "Monthly refresh of Nepal OpenStreetMap data into PostGIS" `
-    -Force
-
-Write-Host "Task $TaskName registered successfully!" -ForegroundColor Green
+Write-Host "Task $TaskName registered successfully (monthly, day 1, 02:00)!" -ForegroundColor Green
+Write-Host "Verify with: schtasks /Query /TN $TaskName /V /FO LIST" -ForegroundColor Gray

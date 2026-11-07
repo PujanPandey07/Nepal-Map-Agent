@@ -10,5 +10,3 @@ pyarrow>=15.0.0
 tlf-geo-profiler>=0.1.0
 tlf-geo>=0.1.1
 python-dotenv>=1.0.0
-pytest>=8.0.0
-pytest-asyncio>=0.24.0

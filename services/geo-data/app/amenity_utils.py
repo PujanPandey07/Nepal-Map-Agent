@@ -27,12 +27,23 @@ EVACUATION_AMENITIES = {
 
 # helipads are aeroway=helipad, not amenity= ; handled separately in classify
 INFRASTRUCTURE_AMENITIES = {
-    "fuel", "water_point",
+    "fuel",
+}
+
+# Drinking-water sources (amenity=) count as food_and_water, alongside shops.
+FOOD_WATER_AMENITIES = {
+    "water_point", "drinking_water",
 }
 
 FOOD_WATER_SHOPS = {
     "supermarket", "convenience", "general",
 }
+
+# emergency=* values.  assembly_point is the OSM tag for a designated
+# evacuation / muster point, so it must land in evacuation_sites.  Every other
+# emergency=* feature (hydrants, defibrillators, phones, sirens, ...) is
+# emergency equipment.
+EMERGENCY_ASSEMBLY_VALUES = {"assembly_point"}
 
 GOVERNMENT_OFFICES = {
     "government", "administrative",
@@ -43,6 +54,7 @@ def classify_element(tags: dict) -> str:
     """Return the category string for a set of OSM tags."""
     amenity   = tags.get("amenity", "")
     healthcare = tags.get("healthcare", "")
+    emergency = tags.get("emergency", "")
     aeroway   = tags.get("aeroway", "")
     office    = tags.get("office", "")
     shop      = tags.get("shop", "")
@@ -53,9 +65,13 @@ def classify_element(tags: dict) -> str:
         return "emergency_services"
     if amenity in EVACUATION_AMENITIES:
         return "evacuation_sites"
+    if emergency in EMERGENCY_ASSEMBLY_VALUES:
+        return "evacuation_sites"
+    if emergency and emergency != "no":
+        return "emergency_services"
     if aeroway == "helipad" or amenity in INFRASTRUCTURE_AMENITIES:
         return "infrastructure"
-    if shop in FOOD_WATER_SHOPS:
+    if shop in FOOD_WATER_SHOPS or amenity in FOOD_WATER_AMENITIES:
         return "food_and_water"
     if office in GOVERNMENT_OFFICES or amenity == "townhall":
         return "government"
@@ -92,10 +108,20 @@ def deduplicate(elements: list[dict]) -> list[dict]:
     Remove duplicate OSM elements — the same facility often appears as both
     a node and a way. Two elements are considered the same when:
       • they share a non-empty name (case-insensitive), AND
+      • they fall in the same category (so a hospital and the pharmacy inside
+        it that happen to share a name are both kept), AND
       • they are within 100 m of each other.
     Unnamed elements are never merged (we cannot know they are the same).
+
+    When a duplicate is dropped, its tags are merged into the element that is
+    kept (the kept element's values win), so detail such as beds= or capacity=
+    that only exists on the dropped node/way is not lost.
+
+    Candidates are bucketed by name, so the cost is O(n · same-name matches)
+    rather than O(n²).
     """
-    seen: list[dict] = []   # {"name": str, "lat": float, "lon": float}
+    # name -> list of (lat, lon, category, index into result)
+    seen: dict[str, list[tuple[float, float, str, int]]] = {}
     result: list[dict] = []
 
     for el in elements:
@@ -104,19 +130,29 @@ def deduplicate(elements: list[dict]) -> list[dict]:
             continue  # cannot place it on the map; drop it
 
         lat, lon = coords
-        name = el.get("tags", {}).get("name", "").lower().strip()
+        tags = el.get("tags") or {}
+        name = (tags.get("name") or "").lower().strip()
 
-        is_dup = False
-        if name:  # only attempt dedup for named elements
-            for seen_el in seen:
-                if (seen_el["name"] == name
-                        and _haversine_m(lat, lon, seen_el["lat"], seen_el["lon"]) < 100):
-                    is_dup = True
-                    break
+        if not name:
+            result.append(el)     # unnamed: never merged
+            continue
 
-        if not is_dup:
-            seen.append({"name": name, "lat": lat, "lon": lon})
+        category = classify_element(tags)
+        dup_idx = None
+        for s_lat, s_lon, s_cat, s_idx in seen.get(name, ()):
+            if s_cat == category and _haversine_m(lat, lon, s_lat, s_lon) < 100:
+                dup_idx = s_idx
+                break
+
+        if dup_idx is None:
+            seen.setdefault(name, []).append((lat, lon, category, len(result)))
             result.append(el)
+        else:
+            kept = result[dup_idx]
+            merged = dict(kept.get("tags") or {})
+            for k, v in tags.items():
+                merged.setdefault(k, v)
+            result[dup_idx] = {**kept, "tags": merged}
 
     return result
 
@@ -140,6 +176,7 @@ def to_amenity_dict(element: dict) -> Optional[dict]:
     type_label = (
         tags.get("amenity")
         or tags.get("healthcare")
+        or tags.get("emergency")
         or tags.get("aeroway")
         or tags.get("office")
         or tags.get("shop")

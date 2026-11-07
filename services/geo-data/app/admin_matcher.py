@@ -68,25 +68,54 @@ def get_nepal_boundary():
             _nepal_boundary = shapely.ops.unary_union(provs.geometry)
     return _nepal_boundary
 
-def match_admin_unit(query: str) -> Optional[dict]:
+def _name_matches(gdf, name: str):
     """
-    Check if query refers to a known administrative unit in Nepal.
-    If matched with high confidence, returns a candidate dict with centroid coords.
+    Case-insensitive *exact* match on name_en.  No regex and no substring
+    matching here: a partial match can silently select the wrong unit.
     """
-    clean_q = query.strip()
-    r = _get_resolver()
+    return gdf[gdf["name_en"].fillna("").str.lower() == str(name).strip().lower()]
 
-    # Search returns list of (label, score), best first.
-    # Score 100.0 means exact or clean suffix match.
-    search_results = r.search(clean_q, limit=3)
-    if not search_results:
-        return None
 
-    top_label, score = search_results[0]
-    # We only auto-match if confidence is strong (score >= 85)
-    if score < 85.0:
-        return None
+# Candidate column names that may hold the official local-level code in the
+# boundary layer.  Only used if present; otherwise we fall back to name.
+_CODE_COLUMNS = ("code", "local_level_code", "lgd_code", "cbs_code", "palika_code")
+_DISTRICT_COLUMNS = ("district", "district_en", "district_name")
 
+
+def _pick_single_row(matches, name: str, info: Optional[dict] = None):
+    """
+    Reduce *matches* to exactly one row or raise ValueError.
+
+    Local-level names repeat across districts, so taking matches.iloc[0] can
+    return the wrong polygon.  If more than one row matches we try to narrow
+    by district; if it is still ambiguous we refuse rather than guess.
+    """
+    if matches.empty:
+        raise ValueError(f"No boundary polygon found for: {name}")
+    if len(matches) == 1:
+        return matches.iloc[0]
+
+    district = None
+    if info:
+        district = info.get("district") or info.get("district_name")
+    if district:
+        for col in _DISTRICT_COLUMNS:
+            if col in matches.columns:
+                narrowed = matches[
+                    matches[col].fillna("").astype(str).str.lower() == str(district).strip().lower()
+                ]
+                if len(narrowed) == 1:
+                    return narrowed.iloc[0]
+                break
+    raise ValueError(
+        f"Ambiguous local level name '{name}': {len(matches)} units share it; "
+        "cannot choose a polygon without the district"
+    )
+
+
+def _candidate_from_label(label: str) -> Optional[dict]:
+    """Build a candidate dict (with centroid) for one tlf-geo search label."""
+    top_label = label
     # Determine level and canonical key
     # label shape is e.g. "sindhupalchok (district)" or "pokhara (metropolitan_city)"
     try:
@@ -108,8 +137,8 @@ def match_admin_unit(query: str) -> Optional[dict]:
 
     if "district" in level_str:
         gdf = _get_gdf("districts")
-        # Match by name_en (case-insensitive) or canonical
-        matches = gdf[gdf["name_en"].str.lower() == canonical_key.lower()]
+        # Match by name_en (case-insensitive, exact)
+        matches = _name_matches(gdf, canonical_key)
         if not matches.empty:
             row = matches.iloc[0]
             geom = row["geometry"]
@@ -122,9 +151,15 @@ def match_admin_unit(query: str) -> Optional[dict]:
 
     elif any(k in level_str for k in ("municipality", "gaunpalika", "metropolitan")):
         gdf = _get_gdf("local_levels")
-        matches = gdf[gdf["name_en"].str.lower() == canonical_key.lower()]
+        matches = _name_matches(gdf, canonical_key)
         if not matches.empty:
-            row = matches.iloc[0]
+            # Names repeat across districts; if we cannot tell which one this
+            # is, return no candidate instead of guessing.
+            try:
+                row = _pick_single_row(matches, canonical_key)
+            except ValueError as exc:
+                logger.warning("Admin match skipped: %s", exc)
+                return None
             geom = row["geometry"]
             c = geom.centroid
             coords = (float(c.y), float(c.x))
@@ -136,7 +171,8 @@ def match_admin_unit(query: str) -> Optional[dict]:
 
     elif "province" in level_str:
         gdf = _get_gdf("provinces")
-        matches = gdf[gdf["name_en"].str.lower().str.contains(canonical_key.lower())]
+        key = canonical_key.lower()
+        matches = gdf[gdf["name_en"].fillna("").str.lower().str.contains(key, regex=False)]
         if not matches.empty:
             row = matches.iloc[0]
             geom = row["geometry"]
@@ -163,11 +199,62 @@ def match_admin_unit(query: str) -> Optional[dict]:
     }
 
 
+def match_admin_units(query: str) -> list[dict]:
+    """
+    All strong administrative matches for *query*.
+
+    Normally one.  More than one is returned when the *same name* exists at
+    different levels (e.g. a district and a municipality both called
+    "Bhaktapur"), so the caller can ask the user which one they mean instead
+    of silently picking whichever ranked first.
+    """
+    clean_q = query.strip()
+    r = _get_resolver()
+
+    # Search returns list of (label, score), best first.
+    # Score 100.0 means exact or clean suffix match.
+    search_results = r.search(clean_q, limit=5)
+    if not search_results:
+        return []
+
+    top_label, top_score = search_results[0]
+    # We only auto-match if confidence is strong (score >= 85)
+    if top_score < 85.0:
+        return []
+
+    top_key = top_label.split("(")[0].strip().lower()
+    out: list[dict] = []
+    seen_labels: set[str] = set()
+    for label, score in search_results:
+        if score < 85.0 or score < top_score - 0.5:
+            continue
+        if label.split("(")[0].strip().lower() != top_key:
+            continue
+        if label in seen_labels:
+            continue
+        seen_labels.add(label)
+        cand = _candidate_from_label(label)
+        if cand:
+            out.append(cand)
+    return out
+
+
+def match_admin_unit(query: str) -> Optional[dict]:
+    """
+    Check if query refers to a known administrative unit in Nepal.
+    If matched with high confidence, returns a candidate dict with centroid coords.
+    (Single-result convenience wrapper; see match_admin_units for ambiguity.)
+    """
+    units = match_admin_units(query)
+    return units[0] if units else None
+
+
 def get_polygon_for_local_level(code: str) -> dict:
     """
     Look up local level polygon boundary by official CBS/LGD code.
     Returns GeoJSON geometry dict.
-    Raises ValueError if code cannot be resolved or geometry is not found.
+    Raises ValueError if code cannot be resolved, the geometry is not found, or
+    the name is shared by several local levels and cannot be narrowed.
     """
     r = _get_resolver()
     info = r.get_by_code(code)
@@ -178,11 +265,18 @@ def get_polygon_for_local_level(code: str) -> dict:
         raise ValueError(f"Could not determine name for local level code: {code}")
 
     gdf = _get_gdf("local_levels")
-    matches = gdf[gdf["name_en"].str.lower() == str(name).lower()]
-    if matches.empty:
-        matches = gdf[gdf["name_en"].str.lower().str.contains(str(name).lower())]
-    if matches.empty:
-        raise ValueError(f"No boundary polygon found for local level: {name}")
 
-    geom = matches.iloc[0]["geometry"]
-    return shapely.geometry.mapping(geom)
+    # Prefer an exact code match when the boundary layer carries a code column.
+    for col in _CODE_COLUMNS:
+        if col in gdf.columns:
+            by_code = gdf[gdf[col].astype(str).str.strip() == str(code).strip()]
+            if len(by_code) == 1:
+                return shapely.geometry.mapping(by_code.iloc[0]["geometry"])
+
+    # Otherwise match by name: exact first, then (single-hit-only) substring.
+    matches = _name_matches(gdf, name)
+    if matches.empty:
+        key = str(name).strip().lower()
+        matches = gdf[gdf["name_en"].fillna("").str.lower().str.contains(key, regex=False)]
+    row = _pick_single_row(matches, str(name), info if isinstance(info, dict) else None)
+    return shapely.geometry.mapping(row["geometry"])
