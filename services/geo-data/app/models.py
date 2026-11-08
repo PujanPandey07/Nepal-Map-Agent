@@ -168,7 +168,6 @@ class AreaAmenitiesResponse(BaseModel):
     summary: AreaSummary = Field(..., description="Summary statistics of amenities in the area")
     categories: dict[str, list[AmenityItem]] = Field(..., description="Amenities grouped by category, up to top_n per category")
     truncated: dict[str, bool] = Field(..., description="Whether each category was truncated by top_n")
-    items: list[AmenityItem] = Field(..., description="List of amenities matching the area")
     top_n: int = Field(10, description="Requested top_n limit per category")
     near_lat: Optional[float] = Field(None, description="Proximity sort center latitude, if provided")
     near_lon: Optional[float] = Field(None, description="Proximity sort center longitude, if provided")

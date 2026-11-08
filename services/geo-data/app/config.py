@@ -41,9 +41,18 @@ DB_NAME: str = os.getenv("DB_NAME", "nepal_osm")
 DB_USER: str = os.getenv("DB_USER", "map-osm")
 DB_PASSWORD: str = os.getenv("DB_PASSWORD", "")    # must be set; never default to a real password
 
-DB_DSN: str = (
-    f"host={DB_HOST} port={DB_PORT} dbname={DB_NAME} "
-    f"user={DB_USER} password={DB_PASSWORD}"
+# Use make_conninfo() instead of an f-string so that passwords containing
+# spaces, single-quotes, backslashes, or other special characters are properly
+# escaped in the libpq keyword=value format.  An f-string would produce
+# "password=pa ss'w\ord" which libpq cannot parse.
+from psycopg.conninfo import make_conninfo  # noqa: E402  (import after dotenv load)
+
+DB_DSN: str = make_conninfo(
+    host=DB_HOST,
+    port=DB_PORT,
+    dbname=DB_NAME,
+    user=DB_USER,
+    password=DB_PASSWORD,
 )
 
 # ── Data freshness ────────────────────────────────────────────────────────────

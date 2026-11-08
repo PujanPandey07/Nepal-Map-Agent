@@ -63,16 +63,18 @@ docker run --rm `
     -v "${PWD}\data:/data" `
     -e PGPASSWORD=$env:POSTGRES_PASSWORD `
     iboates/osm2pgsql `
-    -c -s -l -k `
+    --create --slim --drop --hstore-all --latlong --cache 1000 `
     -H nepal-postgis -P 5432 -U map-osm -d nepal_osm `
     /data/nepal-latest.osm.pbf
 ```
 
 *Flags explained:*
-- `-c`: Create/overwrite tables
-- `-s` (`--slim`): Slim mode for differential updates
-- `-l` (`--latlong`): Store geometries directly in EPSG:4326 (WGS84 lat/lon)
-- `-k` (`--hstore`): Put non-standard tags into the `tags` hstore column (essential for `healthcare`, `emergency`, `capacity`)
+- `--create` (`-c`): Create/overwrite tables
+- `--slim` (`-s`): Slim mode required to parse nodes, ways, and relations from PBF
+- `--drop`: Drop temporary slim tables (planet_osm_nodes/ways/rels) after import; cuts database size by ~40-50% since monthly swap imports do not need differential updates
+- `--hstore-all`: Put all OSM tags into the `tags` hstore column (not just non-standard overflow tags), ensuring full access to all metadata
+- `--latlong` (`-l`): Store geometries directly in EPSG:4326 (WGS84 lat/lon)
+- `--cache 1000`: Allocate 1,000 MB RAM for node caching during import to speed up processing
 
 ---
 
@@ -126,13 +128,16 @@ Workflow:
 2. Creates temporary database `nepal_osm_next` with PostGIS and hstore extensions
 3. Imports data into `nepal_osm_next`
 4. Runs sanity checks:
-   - Row count matches old database within 15-20%
+   - Row count matches old database within -15% / +25% (0.85x to 1.25x of old count)
    - Chhatradev query returns >= 50 amenities
 5. Stops `geo-data` and swaps databases (a few seconds of downtime; every
    native command's exit code is checked and a failed swap is rolled back):
    - Renames `nepal_osm` -> `nepal_osm_old_<timestamp>` (only the newest backup is kept)
    - Renames `nepal_osm_next` -> `nepal_osm`
 6. Updates `DATA_AS_OF` in `.env` and recreates `geo-data` so it picks it up
+
+> [!WARNING]
+> **Do NOT register this scheduled task yet.** Do not run `register_refresh_task.ps1` until `scripts/refresh_osm.ps1` has had at least one real, verified successful run end-to-end.
 
 To automate on Windows Task Scheduler (runs on the 1st of every month at 02:00), run once as Administrator:
 ```powershell
@@ -149,4 +154,4 @@ powershell -ExecutionPolicy Bypass -File scripts/register_refresh_task.ps1
 | `GET` | `/resolve?q=...` | 3-tier place resolver to coordinates with ambiguity flags |
 | `GET` | `/profile?lat=...&lon=...` | Administrative hierarchy (Province down to Ward) and 2021 demographics |
 | `GET` | `/amenities?lat=...&lon=...&radius_m=...` | PostGIS disaster amenities grouped by 7 categories; named node+way duplicates (same category, <100 m) merged |
-| `POST` | `/amenities/area` | Amenities inside a GeoJSON Polygon/MultiPolygon or a `local_level_code` (max 5,000 km², 200k vertices) |
+| `POST` | `/amenities/area` | Amenities inside a GeoJSON Polygon/MultiPolygon or a `local_level_code` (max 8,500 km², 200k vertices) |

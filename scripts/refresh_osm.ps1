@@ -18,7 +18,9 @@ param(
     [string]$DownloadUrl = "https://download.geofabrik.de/asia/nepal-latest.osm.pbf",
     [switch]$SkipDownload = $false,
     [string]$TargetDb = "nepal_osm_next",
-    [switch]$TestOnly = $false
+    [switch]$TestOnly = $false,
+    # LiveDb parameter allows testing rename swap on scratch databases without touching live nepal_osm
+    [string]$LiveDb = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -43,7 +45,7 @@ if (-not (Test-Path $DataDir)) {
 # Read DB credentials from .env
 $DbUser = "map-osm"
 $DbPassword = ""
-$DbName = "nepal_osm"
+$EnvDbName = "nepal_osm"
 
 if (Test-Path $EnvFile) {
     Get-Content $EnvFile | ForEach-Object {
@@ -55,10 +57,22 @@ if (Test-Path $EnvFile) {
                 $val = $parts[1].Trim()
                 if ($key -eq "POSTGRES_USER" -or $key -eq "DB_USER") { $DbUser = $val }
                 if ($key -eq "POSTGRES_PASSWORD" -or $key -eq "DB_PASSWORD") { $DbPassword = $val }
-                if ($key -eq "POSTGRES_DB" -or $key -eq "DB_NAME") { $DbName = $val }
+                if ($key -eq "POSTGRES_DB" -or $key -eq "DB_NAME") { $EnvDbName = $val }
             }
         }
     }
+}
+
+# LiveDb defaults to the database name from .env if not explicitly passed.
+# This enables testing the sanity checks and swap logic against scratch databases
+# (e.g. -LiveDb nepal_osm_refresh_test) while keeping the live database safe.
+if ([string]::IsNullOrWhiteSpace($LiveDb)) {
+    $LiveDb = $EnvDbName
+}
+$DbName = $LiveDb
+
+if ($DbName -notmatch "^[A-Za-z0-9_]+$") {
+    throw "LiveDb must contain only letters, digits and underscores"
 }
 
 # --- helpers --------------------------------------------------------------------
@@ -139,12 +153,13 @@ Write-Host "`n[3/6] Running osm2pgsql import into $TargetDb..." -ForegroundColor
 
 # The compose project is named "nepal-map-agent" (see docker-compose.yml), so
 # the network name does not depend on the folder name.
+# Flags match manual import: --create, --slim, --drop (clean temp tables), --hstore-all, --latlong, --cache 1000
 docker run --rm `
     --network nepal-map-agent_default `
     -v "${DataDir}:/data" `
     -e PGPASSWORD=$DbPassword `
     iboates/osm2pgsql `
-    -c -s -l -k `
+    --create --slim --drop --hstore-all --latlong --cache 1000 `
     -H nepal-postgis -P 5432 -U $DbUser -d $TargetDb `
     "/data/$PbfFileName"
 

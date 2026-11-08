@@ -25,6 +25,7 @@ from typing import Any
 import psycopg
 import psycopg.errors
 import psycopg.rows
+from psycopg.conninfo import make_conninfo          # used to inject connect_timeout
 from psycopg.types import TypeInfo
 from psycopg.types.hstore import register_hstore
 from psycopg_pool import AsyncConnectionPool
@@ -282,6 +283,12 @@ _data_as_of: str | None = None
 _data_as_of_ts: float = 0.0
 _DATA_AS_OF_TTL_SECONDS = 3600.0
 
+# How long (seconds) a single libpq connection attempt is allowed to run.
+# Without this, a down DB causes the OS TCP timeout (~2 min) on each attempt,
+# making every test that lazily touches the pool hang for 2+ minutes.
+# 5 s is long enough for a healthy local container; short enough to fail fast.
+_POOL_CONNECT_TIMEOUT = 5
+
 
 async def _configure_connection(conn: psycopg.AsyncConnection) -> None:
     """Configures each connection upon creation: sets dict_row and registers hstore."""
@@ -295,10 +302,20 @@ async def init_pool() -> AsyncConnectionPool:
     """Initialize and open the database connection pool."""
     global _pool
     if _pool is None:
+        # Merge connect_timeout into the DSN so that each individual libpq
+        # connection attempt aborts after _POOL_CONNECT_TIMEOUT seconds.
+        # This prevents a down DB from hanging the pool open() call (and by
+        # extension, any test that lazily triggers pool creation) for the full
+        # OS TCP timeout (~2 minutes).
+        conninfo = make_conninfo(config.DB_DSN, connect_timeout=_POOL_CONNECT_TIMEOUT)
         _pool = AsyncConnectionPool(
-            conninfo=config.DB_DSN,
+            conninfo=conninfo,
             min_size=1,
             max_size=10,
+            # Set default pool acquisition timeout to 5.0 seconds so all pool.connection()
+            # callers fail fast with PoolTimeout instead of waiting for the 30s default
+            # when the database container is unreachable or down.
+            timeout=5.0,
             open=False,
             configure=_configure_connection,
         )

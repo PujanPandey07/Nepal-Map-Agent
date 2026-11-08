@@ -23,6 +23,32 @@ from app.amenity_utils import (
 )
 from app.resolve_client import parse_candidates, pick_best
 
+# ── DB-availability skip marker ───────────────────────────────────────────────
+# Defined here (before any class) so @_DB_SKIP can decorate tests in every
+# class, including TestHealthEndpoint which appears before
+# TestDbClientIntegration where it previously lived.
+import os as _os
+import socket as _socket
+
+
+def _db_available() -> bool:
+    """Return True if the PostGIS container is reachable."""
+    host = _os.getenv("DB_HOST", "127.0.0.1")
+    if host == "localhost":
+        host = "127.0.0.1"
+    port = int(_os.getenv("DB_PORT", "5433"))
+    try:
+        with _socket.create_connection((host, port), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+_DB_SKIP = pytest.mark.skipif(
+    not _db_available(),
+    reason="PostGIS not reachable (set DB_HOST/DB_PORT or start the container)",
+)
+
 # ── shared sample data ────────────────────────────────────────────────────────
 
 SAMPLE_PROFILE = {
@@ -393,6 +419,7 @@ class TestPickBest:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestHealthEndpoint:
+    @_DB_SKIP  # calls check_db_health -> real DB; hangs ~30 s when container is down
     async def test_returns_ok(self, client):
         resp = await client.get("/health")
         assert resp.status_code == 200
@@ -610,12 +637,29 @@ class TestNominatimFallbackSafety:
         for c in data["candidates"]:
             assert c["source"] == "curated"
 
-    async def test_admin_unit_offline_lookup(self, client):
+    async def test_admin_unit_offline_gorkha_is_ambiguous(self, client):
+        # Querying "Gorkha" matches both the district and the municipality in tlf-geo,
+        # so ambiguous must be True and best_match must be None.
         resp = await client.get("/resolve?q=Gorkha")
         assert resp.status_code == 200
         data = resp.json()
+        assert data["ambiguous"] is True
+        assert data["best_match"] is None
+        assert data["clarification_needed"] is True
+        assert len(data["candidates"]) == 2
+        types = {c["type"] for c in data["candidates"]}
+        assert types == {"district", "municipality"}
+
+    async def test_admin_unit_offline_unambiguous_lookup(self, client):
+        # "Manang" is unique across all districts and municipalities in tlf-geo
+        # (exactly 1 district, 0 municipalities), so ambiguous must be False.
+        resp = await client.get("/resolve?q=Manang")
+        assert resp.status_code == 200
+        data = resp.json()
         assert data["ambiguous"] is False
-        assert data["best_match"]["short_name"] == "Gorkha"
+        assert data["best_match"] is not None
+        assert data["best_match"]["short_name"] == "Manang"
+        assert data["best_match"]["type"] == "district"
         assert data["best_match"]["source"] == "tlf-geo"
 
     async def test_admin_unit_chhatradev_nan_name_ne_returns_null(self, client):
@@ -741,27 +785,6 @@ class TestDbClientRowConversion:
 # Integration test — real PostGIS database (skipped when DB is not reachable)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-import os as _os
-
-
-def _db_available() -> bool:
-    """Return True if the PostGIS container is reachable."""
-    import socket
-    host = _os.getenv("DB_HOST", "127.0.0.1")
-    if host == "localhost":
-        host = "127.0.0.1"
-    port = int(_os.getenv("DB_PORT", "5433"))
-    try:
-        with socket.create_connection((host, port), timeout=2):
-            return True
-    except OSError:
-        return False
-
-
-_DB_SKIP = pytest.mark.skipif(
-    not _db_available(),
-    reason="PostGIS not reachable (set DB_HOST/DB_PORT or start the container)",
-)
 
 
 class TestDbClientIntegration:
@@ -906,6 +929,8 @@ class TestPhase2AmenitiesArea:
         ],
     }
 
+    @_DB_SKIP  # calls fetch_amenities_area -> real PostGIS; hangs when container is down
+
     async def test_amenities_area_valid_polygon(self, client):
         payload = {"geometry": self.sample_poly}
         resp = await client.post("/amenities/area", json=payload)
@@ -916,9 +941,12 @@ class TestPhase2AmenitiesArea:
         assert "by_category" in data["summary"]
         assert "by_type" in data["summary"]
         assert "total" in data["summary"]
-        assert "items" in data
-        assert isinstance(data["items"], list)
+        # Decision A: 'items' dropped to eliminate duplicate data; amenities grouped in 'categories'
+        assert "items" not in data
+        assert "categories" in data
         assert "data_as_of" in data
+
+    @_DB_SKIP  # calls fetch_amenities_area -> real PostGIS; hangs when container is down
 
     async def test_amenities_area_by_local_level_code(self, client):
         # 55102 is Chhatradev rural municipality
@@ -935,6 +963,8 @@ class TestPhase2AmenitiesArea:
         payload = {"geometry": {"type": "Point", "coordinates": [85.30, 27.70]}}
         resp = await client.post("/amenities/area", json=payload)
         assert resp.status_code == 422
+
+    @_DB_SKIP  # calls fetch_amenities_area -> real PostGIS; hangs when container is down
 
     async def test_amenities_area_empty_result(self, client):
         # Small polygon in uninhabited wilderness coordinates inside Nepal (Langtang)
@@ -954,7 +984,10 @@ class TestPhase2AmenitiesArea:
         assert resp.status_code == 200
         data = resp.json()
         assert data["summary"]["total"] == 0
-        assert data["items"] == []
+        assert "items" not in data
+        assert all(len(v) == 0 for v in data["categories"].values())
+
+    @_DB_SKIP  # calls fetch_amenities_area -> real PostGIS; hangs when container is down
 
     async def test_amenities_area_top_n_with_proximity(self, client):
         payload = {
@@ -968,8 +1001,8 @@ class TestPhase2AmenitiesArea:
         data = resp.json()
         for cat, cat_items in data["categories"].items():
             assert len(cat_items) <= 3
-        # Summary total should reflect the overall area, not just top_n
-        assert data["summary"]["total"] >= len(data["items"])
+        # Decision A: 'items' dropped; summary total >= sum of top_n items across categories
+        assert data["summary"]["total"] >= sum(len(v) for v in data["categories"].values())
 
     async def test_amenities_area_statement_timeout_simulated(self, client):
         with patch("app.main.fetch_amenities_area", side_effect=TimeoutError("Statement timed out")):
@@ -1051,12 +1084,16 @@ class TestPhase1AreaAmenitiesContractFixes:
         assert resp.status_code == 422
         assert "outside nepal" in resp.json()["detail"].lower()
 
+    @_DB_SKIP  # calls fetch_amenities_area via local_level_code -> real PostGIS
+
     async def test_chhatradev_outside_fraction_zero(self, client):
         resp = await client.post("/amenities/area", json={"local_level_code": "55102"})
         assert resp.status_code == 200
         data = resp.json()
         assert "outside_nepal_fraction" in data["area"]
         assert data["area"]["outside_nepal_fraction"] == 0.0
+
+    @_DB_SKIP  # calls fetch_amenities_area -> real PostGIS; hangs when container is down
 
     async def test_biratnagar_straddle_outside_fraction_positive(self, client):
         resp = await client.post("/amenities/area", json={"geometry": self.biratnagar_straddle_box})
@@ -1071,11 +1108,12 @@ class TestPhase1AreaAmenitiesContractFixes:
         assert resp.status_code == 422
         assert "outside" in resp.json()["detail"].lower()
 
-    async def test_reject_box_over_5000_km2(self, client):
+    async def test_reject_box_over_8500_km2(self, client):
+        # Decision B: MAX_AREA_KM2 raised to 8,500 km2 to accommodate Dolpa district (~7,940 km2)
         resp = await client.post("/amenities/area", json={"geometry": self.large_box_10900km2})
         assert resp.status_code == 422
         detail = resp.json()["detail"].lower()
-        assert "5,000" in detail or "5000" in detail or "exceeds" in detail
+        assert "8,500" in detail or "8500" in detail or "exceeds" in detail
 
     async def test_reject_top_n_over_50(self, client):
         resp = await client.post(
@@ -1083,6 +1121,8 @@ class TestPhase1AreaAmenitiesContractFixes:
             json={"geometry": self.sample_ktm_box, "top_n": 51},
         )
         assert resp.status_code == 422
+
+    @_DB_SKIP  # calls fetch_amenities_area -> real PostGIS; hangs when container is down
 
     async def test_area_block_and_top_n_per_category(self, client):
         resp = await client.post(
@@ -1104,6 +1144,8 @@ class TestPhase1AreaAmenitiesContractFixes:
             assert len(items) <= 3
             assert cat in data["truncated"]
             assert isinstance(data["truncated"][cat], bool)
+
+    @_DB_SKIP  # calls fetch_amenities_area -> real PostGIS; hangs when container is down
 
     async def test_self_intersecting_geometry_is_repaired(self, client):
         # Bowtie polygon (self-intersecting)

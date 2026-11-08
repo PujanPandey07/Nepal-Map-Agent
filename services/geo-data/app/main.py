@@ -53,7 +53,8 @@ DATA_WARNING = (
 )
 
 # Limits for /amenities/area
-MAX_AREA_KM2 = 5000.0
+# Raised from 5,000 to 8,500 km2 to accommodate all 77 districts (largest is Dolpa at ~7,940 km2)
+MAX_AREA_KM2 = 8500.0
 MAX_GEOMETRY_VERTICES = 200_000   # guards the DB and CPU against huge payloads
 
 # Category keys in the order we want them in the response
@@ -233,7 +234,6 @@ async def get_amenities(
 
     Categories returned:
       health            hospitals, clinics, pharmacies, health posts
-      emergency_services  police, fire stations, ambulance stations
       emergency_services  police, fire stations, ambulance stations and other
                         emergency=* equipment (hydrants, defibrillators, ...)
       evacuation_sites  schools, community centres, shelters, places of worship,
@@ -372,7 +372,7 @@ async def post_amenities_area(request: Request, body: AreaAmenitiesRequest):
     if area_km2 > MAX_AREA_KM2:
         raise HTTPException(
             status_code=422,
-            detail="Geometry area exceeds maximum limit of 5,000 km2",
+            detail="Geometry area exceeds maximum limit of 8,500 km2",
         )
 
     # Send repaired geometry to the database
@@ -425,7 +425,6 @@ async def post_amenities_area(request: Request, body: AreaAmenitiesRequest):
             truncated[cat] = True
         categories[cat] = cat_items[: body.top_n]
 
-    items = [item for cat in CATEGORY_ORDER for item in categories[cat]]
     data_as_of = await get_data_as_of()
 
     return {
@@ -440,7 +439,6 @@ async def post_amenities_area(request: Request, body: AreaAmenitiesRequest):
         "summary": summary,
         "categories": categories,
         "truncated": truncated,
-        "items": items,
         "top_n": body.top_n,
         "near_lat": body.near_lat,
         "near_lon": body.near_lon,
